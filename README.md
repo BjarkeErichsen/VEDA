@@ -8,14 +8,16 @@ Compared to the MiDi baseline, VEDA adds residual preconditioning to better inte
 
 ## Models and Datasets
 
-You can either download pre-trained models and processed datasets directly from:
-- [Google Drive: Models and Data](https://drive.google.com/drive/folders/1-1jYJ1EKOUX6FA5NrcKUAcbSdB-1mhXu?usp=sharing)
+You can download the pre-trained VEDA model weights from:
+- [Google Drive: VEDA Model Weights](https://drive.google.com/drive/folders/1-1jYJ1EKOUX6FA5NrcKUAcbSdB-1mhXu?usp=sharing)
+
+Processed datasets are available in the [Semla-Flow Google Drive folder](https://drive.google.com/drive/folders/1zZ2xkHbATYqrjgRTn6JHj_Xf7Gcpb0pW), associated with the Semla-Flow paper.
 
 Or process the datasets yourself:
 
 ### QM9
 
-We copied the code from [MiDi](https://github.com/cvignac/MiDi) to download the QM9 dataset and create the data splits. We provide the code to do this, as well as create the Smol internal dataset representation used for training in the `notebooks/qm9.ipynb` notebook.
+For QM9, download the processed dataset from the [Semla-Flow Google Drive folder](https://drive.google.com/drive/folders/1zZ2xkHbATYqrjgRTn6JHj_Xf7Gcpb0pW). If you are preparing QM9 from the raw dataset, follow the download and split procedure from [MiDi](https://github.com/cvignac/MiDi). The training and evaluation scripts expect the processed files `train.smol`, `val.smol`, and `test.smol` under the dataset directory.
 
 ### GEOM-DRUGS
 
@@ -32,40 +34,33 @@ python preprocess.py --data_path path/to/geom-drugs --raw_data_folder raw --save
 
 ## Installation
 
-This code was tested with PyTorch 2.0.1, CUDA 11.8, and torch_geometric 2.3.1 on multi-GPU machines.
+This checkout is intended to run in the existing `equinv` conda environment. The versions verified in that environment are:
 
-- Download anaconda/miniconda if needed.
-- Create the environment that already bundles RDKit:
+- Python 3.11.11
+- PyTorch 2.7.1 with CUDA 12.8 support
+- RDKit 2024.09.5
+- Lightning 2.5.0.post0
+- Open Babel 3.1.0
 
-  ```bash
-  conda create -c conda-forge -n midi rdkit=2023.03.2 python=3.9
-  conda activate midi
-  ```
-
-- Verify RDKit:
+Activate the environment before running any command:
 
   ```bash
-  python3 -c "from rdkit import Chem"
+  conda activate equinv
   ```
 
-- Install CUDA toolkits matching your driver, e.g.
+You can verify the main dependencies with:
 
   ```bash
-  conda install -c "nvidia/label/cuda-11.8.0" cuda
+  python -c "import torch, lightning; from rdkit import Chem; from openbabel import pybel; print(torch.__version__, torch.version.cuda, lightning.__version__)"
   ```
 
-- Install PyTorch (adjust if your CUDA version differs):
-
-  ```bash
-  pip3 install torch==2.0.1 --index-url https://download.pytorch.org/whl/cu118
-  ```
-
-- Install the remaining dependencies and set up the package:
+If a dependency is missing from the local environment, install the repository requirements after activating `equinv`:
 
   ```bash
   pip install -r requirements.txt
-  pip install -e .
   ```
+
+The repository is run directly from its root directory; no editable package installation is required.
 
 ## Running QM9 experiments
 
