@@ -1,0 +1,3 @@
+# Backwards-compatible alias for the VEDA-E runtime dependencies.
+# The previous file was a stale pip freeze from an older PyTorch 1.12 setup.
+-r requirements.txt

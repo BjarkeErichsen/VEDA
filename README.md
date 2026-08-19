@@ -6,6 +6,15 @@ This repository contains the reference implementation of **VEDA: 3D Molecular Ge
 
 Compared to the MiDi baseline, VEDA adds residual preconditioning to better interface coordinate-predicting networks with diffusion objectives, achieving state-of-the-art valency stability and a median relaxation energy drop of 1.72 kcal/mol on GEOM-DRUGS while keeping sampling to 100 steps, as reported in the paper.
 
+## VEDA-E
+
+The [`VEDA-E/`](VEDA-E/) directory contains a separate VEDA-E implementation based on the EDM/equivariant-diffusion code path. It is provided as a cleaned checkpoint package with selected EMA model weights for QM9 and GEOM-Drugs:
+
+- QM9: `VEDA-E/outputs/qm9_veda_e/generative_model_ema.npy`
+- GEOM-Drugs: `VEDA-E/outputs/geom_drugs_veda_e/generative_model_ema.npy`
+
+The VEDA-E dataset pipeline largely follows [e3_diffusion_for_molecules](https://github.com/ehoogeboom/e3_diffusion_for_molecules/tree/main). The datasets are not included in `VEDA-E`: QM9 data is expected under `VEDA-E/qm9/temp/qm9/`, while the GEOM-Drugs dataset must be restored separately and supplied with `--data_file`. Use the `edm` conda environment for this code path; VEDA-E currently supports single-GPU execution. Run commands from inside `VEDA-E/`. See [`VEDA-E/README.md`](VEDA-E/README.md) for dataset requirements, evaluation commands, sampler settings, and training details.
+
 ## Models and Datasets
 
 You can download the pre-trained VEDA model weights from:

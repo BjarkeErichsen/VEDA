@@ -1,0 +1,25 @@
+from setuptools import setup, find_packages
+
+setup(
+    name='EN_diffusion',
+    version='1.0.0',
+    url=None,
+    author='Author Name',
+    author_email='author@gmail.com',
+    description='Description of my package',
+    packages=find_packages(),
+    install_requires=[
+        'imageio==2.22.0',
+        'matplotlib==3.5.2',
+        'msgpack==1.0.3',
+        'numpy==1.22.4',
+        'scipy==1.9.1',
+        'torch==2.2.2',
+        'torchvision==0.17.2',
+        'tqdm==4.64.1',
+        'wandb==0.13.4',
+        'rdkit==2025.3.2',
+        'unimol-tools==0.1.4.post1',
+        'fcd-torch==1.0.7',
+    ]
+)
