@@ -12,6 +12,12 @@ from qm9.data.prepare.process import process_xyz_files, process_xyz_gdb9
 from qm9.data.prepare.utils import download_data, is_int, cleanup_file
 
 
+# Figshare serves these files from the same official records through this
+# downloader host.  The springernature hostname currently returns an AWS WAF
+# challenge on some compute nodes instead of the dataset bytes.
+FIGSHARE_DOWNLOADER = 'https://ndownloader.figshare.com/files/{}'
+
+
 def download_dataset_qm9(datadir, dataname, splits=None, calculate_thermo=True, exclude=True, cleanup=True):
     """
     Download and prepare the QM9 (GDB9) dataset.
@@ -26,7 +32,7 @@ def download_dataset_qm9(datadir, dataname, splits=None, calculate_thermo=True, 
         'Downloading and processing GDB9 dataset. Output will be in directory: {}.'.format(gdb9dir))
 
     logging.info('Beginning download of GDB9 dataset!')
-    gdb9_url_data = 'https://springernature.figshare.com/ndownloader/files/3195389'
+    gdb9_url_data = FIGSHARE_DOWNLOADER.format(3195389)
     gdb9_tar_data = join(gdb9dir, 'dsgdb9nsd.xyz.tar.bz2')
     # gdb9_tar_file = join(gdb9dir, 'dsgdb9nsd.xyz.tar.bz2')
     # gdb9_tar_data =
@@ -80,7 +86,7 @@ def gen_splits_gdb9(gdb9dir, cleanup=True):
     set.
     """
     logging.info('Splits were not specified! Automatically generating.')
-    gdb9_url_excluded = 'https://springernature.figshare.com/ndownloader/files/3195404'
+    gdb9_url_excluded = FIGSHARE_DOWNLOADER.format(3195404)
     gdb9_txt_excluded = join(gdb9dir, 'uncharacterized.txt')
     urllib.request.urlretrieve(gdb9_url_excluded, filename=gdb9_txt_excluded)
 
@@ -144,7 +150,7 @@ def get_thermo_dict(gdb9dir, cleanup=True):
     """
     # Download thermochemical energy
     logging.info('Downloading thermochemical energy.')
-    gdb9_url_thermo = 'https://springernature.figshare.com/ndownloader/files/3195395'
+    gdb9_url_thermo = FIGSHARE_DOWNLOADER.format(3195395)
     gdb9_txt_thermo = join(gdb9dir, 'atomref.txt')
 
     urllib.request.urlretrieve(gdb9_url_thermo, filename=gdb9_txt_thermo)

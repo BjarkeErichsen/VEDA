@@ -5,6 +5,7 @@ try:
 except ModuleNotFoundError:
     use_rdkit = False
 import qm9.dataset as dataset
+import os
 import torch
 import matplotlib
 matplotlib.use('Agg')
@@ -437,7 +438,60 @@ def save_sdf_file(output_sdf_path, molecule_list, dataset_info):
     # Step 4: Close the SDF writer
     sdf_writer.close()
     
-def compute_fcd_score(molecule_list, dataset_info):
+def prepare_qm9_test_sdf(datadir, dataset_info, output_sdf_path=None):
+    """Create the QM9 test-set reference SDF used by FCD evaluation.
+
+    The original implementation assumed a fixed ``qm9/temp`` location and
+    expected a manually created SDF file.  Build it from the official
+    processed ``test.npz`` instead, so ``--datadir`` is the only data-path
+    setting needed for a reproducible run.
+    """
+    data_dir = os.path.join(datadir, 'qm9')
+    if output_sdf_path is None:
+        output_sdf_path = os.path.join(data_dir, 'qm9_test_output.sdf')
+
+    if os.path.isfile(output_sdf_path) and os.path.getsize(output_sdf_path) > 0:
+        return output_sdf_path
+
+    test_npz = os.path.join(data_dir, 'test.npz')
+    if not os.path.isfile(test_npz):
+        raise FileNotFoundError(
+            f'QM9 test split not found at {test_npz}; run the QM9 download/process step first.'
+        )
+
+    logging_message = f'Preparing QM9 FCD reference SDF at {output_sdf_path}'
+    print(logging_message)
+    os.makedirs(os.path.dirname(output_sdf_path), exist_ok=True)
+    temporary_path = output_sdf_path + '.tmp'
+
+    periodic_table = Chem.GetPeriodicTable()
+    charge_to_type = {
+        periodic_table.GetAtomicNumber(symbol): atom_type
+        for atom_type, symbol in enumerate(dataset_info['atom_decoder'])
+    }
+
+    with np.load(test_npz) as data:
+        positions = torch.from_numpy(data['positions']).float()
+        charges = torch.from_numpy(data['charges']).long()
+
+    atom_types = torch.zeros_like(charges)
+    for charge, atom_type in charge_to_type.items():
+        atom_types[charges == charge] = atom_type
+
+    one_hot = torch.nn.functional.one_hot(
+        atom_types, num_classes=len(dataset_info['atom_decoder'])
+    ).float()
+    molecule_list = {
+        'one_hot': one_hot,
+        'x': positions,
+        'node_mask': charges > 0,
+    }
+    save_sdf_file(temporary_path, molecule_list, dataset_info)
+    os.replace(temporary_path, output_sdf_path)
+    return output_sdf_path
+
+
+def compute_fcd_score(molecule_list, dataset_info, reference_sdf_path):
     one_hot = molecule_list['one_hot']
     x = molecule_list['x']
     node_mask = molecule_list['node_mask']
@@ -462,7 +516,7 @@ def compute_fcd_score(molecule_list, dataset_info):
         molecules.append(mol)
 
 
-    refer = Chem.SDMolSupplier('./qm9/temp/qm9/qm9_test_output.sdf')
+    refer = Chem.SDMolSupplier(reference_sdf_path)
     # Filter out invalid molecules
     mols = [mol for mol in molecules if mol is not None]
     ref_mols = [mol for mol in refer if mol is not None]
@@ -840,4 +894,3 @@ if __name__ == '__main__':
 
     # main_analyze_qm9(remove_h=False, dataset_name='qm9')
     main_check_stability(remove_h=False)
-

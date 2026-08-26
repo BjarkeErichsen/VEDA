@@ -248,7 +248,8 @@ def analyze_and_save(epoch, model_sample, nodes_dist, args, device, dataset_info
     print(validity_dict)
     if 'qm9' in dataset_info['name']:
         if args.compute_fcd:
-            fcd_score = compute_fcd_score(molecules, dataset_info)
+            fcd_score = compute_fcd_score(
+                molecules, dataset_info, args.fcd_reference_sdf)
             wandb.log({'fcd_score':fcd_score})
     wandb.log(validity_dict)
     if rdkit_tuple is not None:
@@ -277,7 +278,8 @@ def analyze_and_save_sampler(epoch, model_sample, nodes_dist, args, device, data
     validity_dict, rdkit_tuple = analyze_stability_for_molecules(molecules, dataset_info)
     print(validity_dict)
     if args.compute_fcd and 'qm9' in dataset_info['name']:
-        fcd_score = compute_fcd_score(molecules, dataset_info)
+        fcd_score = compute_fcd_score(
+            molecules, dataset_info, args.fcd_reference_sdf)
         wandb.log({'fcd_score'+str(sample_steps):fcd_score})
     # wandb.log(validity_dict)
     wandb.log({'mol_stable'+str(sample_steps): validity_dict['mol_stable'],'atm_stable'+str(sample_steps): validity_dict['atm_stable'],})

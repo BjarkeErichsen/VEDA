@@ -18,6 +18,7 @@ import torch
 import time
 import pickle
 from qm9.utils import prepare_context, compute_mean_mad
+from qm9.analyze import prepare_qm9_test_sdf
 from train_test import train_epoch, test, analyze_and_save, analyze_and_save_sampler
 
 parser = argparse.ArgumentParser(description='E3Diffusion')
@@ -189,6 +190,9 @@ wandb.save('*.txt')
 
 # Retrieve QM9 dataloaders
 dataloaders, charge_scale = dataset.retrieve_dataloaders(args)
+
+if args.compute_fcd:
+    args.fcd_reference_sdf = prepare_qm9_test_sdf(args.datadir, dataset_info)
 
 data_dummy = next(iter(dataloaders['train']))
 

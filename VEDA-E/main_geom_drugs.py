@@ -100,7 +100,7 @@ parser.add_argument('--ema_decay', type=float, default=0.9999,
                     help='Amount of EMA decay, 0 means off. A reasonable value'
                          ' is 0.999.')
 parser.add_argument('--augment_noise', type=float, default=0)
-parser.add_argument('--n_stability_samples', type=int, default=20,
+parser.add_argument('--n_stability_samples', type=int, default=100,
                     help='Number of samples to compute the stability')
 parser.add_argument('--normalize_factors', type=eval, default=[1, 4, 10],
                     help='normalize factors for [x, categorical, integer]')
@@ -167,6 +167,7 @@ if args.resume is not None:
     wandb_usr = args.wandb_usr
     wandb_run_id = args.wandb_run_id
     visualize_every_batch = args.visualize_every_batch
+    diffusion_steps = args.diffusion_steps
 
     with open(join(args.resume, 'args.pickle'), 'rb') as f:
         args = pickle.load(f)
@@ -177,6 +178,7 @@ if args.resume is not None:
     args.wandb_usr = wandb_usr
     args.wandb_run_id = wandb_run_id
     args.visualize_every_batch = visualize_every_batch
+    args.diffusion_steps = diffusion_steps
     print(args)
 
 utils.create_folders(args)
