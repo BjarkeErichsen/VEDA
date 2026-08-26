@@ -75,6 +75,8 @@ The repository is run directly from its root directory; no editable package inst
 
 For the QM9 setup of VEDA-S used in the paper, we launch training with:
 
+<p style="color: red;"><strong>Warning (2026/08/26):</strong> Earlier versions of <code>--use_cat_time_based_weight</code> incorrectly used the first sample's time to weight the entire batch and applied the weight after batch averaging. This bug is fixed in the current version: categorical loss weights are now computed per sample and applied before averaging. Use the current <code>models/fm.py</code> when reproducing results.</p>
+
 ```bash
 python train.py \
   --data_path data/qm9/smol/ \

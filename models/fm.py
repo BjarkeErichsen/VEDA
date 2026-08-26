@@ -254,19 +254,20 @@ class Integrator:
                 float(mask_rates[0].item()), 
                 float(delta_mask_rates[0].item()))
     def _compute_mask_rates(self, times):
-        """Compute mask rates based on strategy
-        
+        """Compute one mask rate per sample in ``times``.
+
         For 'edm' strategy: mask_rate = t/(t+1) from DFM mask prior derivation.
         See _compute_mask_rate_deltas docstring for detailed explanation.
         """
+        if not isinstance(times, torch.Tensor):
+            times = torch.as_tensor(times, dtype=torch.get_default_dtype())
+        times = times.reshape(-1)
+
         if self.mask_rate_strategy == 'log_uniform':
-            # Extract first element if times is a tensor with multiple elements
-            # Similar to _compute_mask_rate_deltas, extract scalar value first
-            t = times[0].item() if isinstance(times, torch.Tensor) else times[0] if hasattr(times, '__getitem__') else times
-            mask_rates = float((np.log(t) - (self.time_mean - self.time_sigma*4))/(self.time_sigma*8))
+            mask_rates = (torch.log(times) - (self.time_mean - self.time_sigma*4)) / (self.time_sigma*8)
         else:  # 'edm' or None - uses DFM formula: mask_rate = t/(t+1)
-            mask_rates = (times/(times + 1))[0].item()
-        mask_rates = np.clip(mask_rates, self.eps, 1 - self.eps)
+            mask_rates = times / (times + 1)
+        mask_rates = mask_rates.clamp(min=self.eps, max=1 - self.eps)
         return mask_rates
     
     def _dfm_gat_sampler_step(self, curr_dist, pred_dist, t, step_size):
@@ -806,8 +807,7 @@ class MolecularCFM(L.LightningModule):
         coef = self._prepare_coef(times)
         if self.use_cat_time_based_weight:
             mask_rates = self.integrator._compute_mask_rates(times)
-            cat_time_based_weight = 1/mask_rates
-            cat_time_based_weight = np.clip(cat_time_based_weight, 0, 10)
+            cat_time_based_weight = (1 / mask_rates).clamp(min=0, max=10)
         else:
             cat_time_based_weight = 1
             
@@ -970,9 +970,9 @@ class MolecularCFM(L.LightningModule):
         charge_loss = self._charge_loss(data, predicted)
         
         coord_loss = (coord_loss * coord_time_based_weight).mean()
-        type_loss = type_loss.mean() * self.type_loss_weight * cat_time_based_weight
-        bond_loss = bond_loss.mean() * self.bond_loss_weight * cat_time_based_weight
-        charge_loss = charge_loss.mean() * self.charge_loss_weight * cat_time_based_weight
+        type_loss = (type_loss * cat_time_based_weight).mean() * self.type_loss_weight
+        bond_loss = (bond_loss * cat_time_based_weight).mean() * self.bond_loss_weight
+        charge_loss = (charge_loss * cat_time_based_weight).mean() * self.charge_loss_weight
         
         losses = {
             "coord-loss": coord_loss,
