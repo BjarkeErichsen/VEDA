@@ -60,6 +60,11 @@ DEFAULT_OPTIMAL_TRANSPORT = None
 DEFAULT_MAX_SIGMA = 80
 DEFAULT_MIN_SIGMA = 0.001
 DEFAULT_SAMPLING_SCHEDULER_FACTOR_RHO = 2.0
+DEFAULT_LATENT_RECURSION = False
+DEFAULT_LATREC_N = 0
+DEFAULT_LATREC_K = 1
+DEFAULT_LATREC_P = 0.5
+DEFAULT_LATREC_TRANSFER = "identity"
 
 
 
@@ -102,7 +107,9 @@ def build_model(args, dm, vocab):
         n_edge_types=n_bond_types,
         self_cond=args.self_condition,
         size_emb=args.size_emb,
-        max_atoms=args.max_atoms
+        max_atoms=args.max_atoms,
+        latent_recursion=args.latent_recursion,
+        latrec_transfer=args.latrec_transfer,
     )
 
     if args.dataset == "qm9":
@@ -150,7 +157,6 @@ def build_model(args, dm, vocab):
         bond_mask_index=bond_mask_index,
         prior_sampler = dm.prior_sampler,
         data_module = dm,
-        # mask_times_factor removed - see Integrator class for details
         mask_rate_strategy = args.mask_rate_strategy,
         max_sigma=args.max_sigma,
         min_sigma=args.min_sigma,
@@ -171,6 +177,11 @@ def build_model(args, dm, vocab):
         use_ema=args.use_ema,
         compile_model=False,
         self_condition=args.self_condition,
+        latent_recursion=args.latent_recursion,
+        latrec_n=args.latrec_n,
+        latrec_k=args.latrec_k,
+        latrec_p=args.latrec_p,
+        latrec_transfer=args.latrec_transfer,
         distill=False,
         lr_schedule=args.lr_schedule,
         warm_up_steps=args.warm_up_steps,
@@ -286,7 +297,7 @@ def build_dm(args, vocab):
         equivariant_ot=False,
         batch_ot=False,
         fixed_time=0.5,
-        # mask_times_factor removed - see GeometricInterpolant class for details
+        mask_rate_strategy=args.mask_rate_strategy,
     )
 
     dm = GeometricInterpolantDM(
@@ -314,14 +325,17 @@ def build_trainer(args):
     project_name = f"{util.PROJECT_PREFIX}-{args.dataset}"
     print("Using precision '32'")
     if args.ckpt_path is not None:
-        logger = WandbLogger(project=project_name,save_dir="wandb", log_model=True, id=args.wandb_id,resume='allow')
+        logger = WandbLogger(project=project_name, save_dir="wandb", log_model=False, id=args.wandb_id, resume='allow')
     else:
-        logger = WandbLogger(project=project_name, save_dir="wandb", log_model=True)
+        logger = WandbLogger(project=project_name, save_dir="wandb", log_model=False)
     
     lr_monitor = LearningRateMonitor(logging_interval="step")
-    checkpointing = ModelCheckpoint(every_n_epochs=val_check_epochs, monitor="val-validity", mode="max", save_last=True, 
-                                    save_top_k=1,
-                                    filename="best-{epoch:02d}-{val-validity:.4f}")
+    checkpointing = ModelCheckpoint(
+        dirpath="output/checkpoints",
+        every_n_epochs=val_check_epochs,
+        save_last=True,
+        save_top_k=0,
+    )
 
     # No logger if doing a trial run
     logger = None if args.trial_run else logger
@@ -364,7 +378,24 @@ def main(args):
     model = build_model(args, dm, vocab)
     print("Model complete.")
 
+    num_params = sum(p.numel() for p in model.parameters())
+    num_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model Architecture: {args.n_layers} GNN layers | Total Parameters: {num_params:,} (Trainable: {num_trainable_params:,})")
+
     trainer = build_trainer(args)
+
+    if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+        try:
+            trainer.logger.experiment.config.update(
+                {
+                    "num_parameters": num_params,
+                    "num_trainable_parameters": num_trainable_params,
+                    "n_layers": args.n_layers,
+                },
+                allow_val_change=True,
+            )
+        except Exception as e:
+            print(f"Warning: Could not update WandB config with parameter counts: {e}")
 
     print("Fitting datamodule to model...")
     if args.ckpt_path is not None:
@@ -411,7 +442,8 @@ if __name__ == "__main__":
     parser.add_argument("--warm_up_steps", type=int, default=DEFAULT_WARM_UP_STEPS)
     parser.add_argument("--bucket_cost_scale", type=str, default=DEFAULT_BUCKET_COST_SCALE)
     parser.add_argument("--no_ema", action="store_false", dest="use_ema")
-    parser.add_argument("--self_condition", action="store_true")
+    parser.add_argument("--self_condition", action="store_true", dest="self_condition", help="Enable self-conditioning")
+    parser.add_argument("--no_self_condition", action="store_false", dest="self_condition", help="Disable self-conditioning")
     parser.add_argument("--test_run", action="store_true")    
     parser.add_argument("--mask_rate_strategy", type=str, default=DEFAULT_MASK_RATE_STRATEGY)
     parser.add_argument("--use_cat_time_based_weight", action="store_true")
@@ -438,11 +470,19 @@ if __name__ == "__main__":
     parser.add_argument("--min_sigma", type=float, default=DEFAULT_MIN_SIGMA)
     parser.add_argument("--sampling_scheduler_factor_rho", type=float, default=DEFAULT_SAMPLING_SCHEDULER_FACTOR_RHO)
     
+    # Latent Recursion flags
+    parser.add_argument("--latent_recursion", action="store_true", default=DEFAULT_LATENT_RECURSION, help="Enable latent recursion pass-through")
+    parser.add_argument("--no_latent_recursion", action="store_false", dest="latent_recursion", help="Disable latent recursion pass-through")
+    parser.add_argument("--latrec_n", type=int, default=DEFAULT_LATREC_N, help="Number of tracked BPTT passes (default: 0)")
+    parser.add_argument("--latrec_k", type=int, default=DEFAULT_LATREC_K, help="Number of untracked warm-up passes (default: 1)")
+    parser.add_argument("--latrec_p", type=float, default=DEFAULT_LATREC_P, help="Chain execution probability (default: 0.5)")
+    parser.add_argument("--latrec_transfer", type=str, default=DEFAULT_LATREC_TRANSFER, help="Transfer operator (default: identity)")
 
     parser.set_defaults(
         trial_run=False,
         use_ema=True,
         self_condition=True,
+        latent_recursion=False,
     )
 
     args = parser.parse_args()

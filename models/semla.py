@@ -726,6 +726,8 @@ class SemlaGenerator(MolecularGenerator):
         self_cond=False,
         size_emb=64,
         max_atoms=256,
+        latent_recursion=False,
+        latrec_transfer="identity",
     ):
 
         hparams = {
@@ -737,12 +739,35 @@ class SemlaGenerator(MolecularGenerator):
             "self_cond": self_cond,
             "size_emb": size_emb,
             "max_atoms": max_atoms,
+            "latent_recursion": latent_recursion,
+            "latrec_transfer": latrec_transfer,
             **dynamics.hparams,
         }
 
         super().__init__(**hparams)
 
         self.self_cond = self_cond
+        self.latent_recursion = latent_recursion
+        self.latrec_transfer = latrec_transfer
+
+        if self.latent_recursion:
+            if latrec_transfer == "linear":
+                self.latrec_mlp = torch.nn.Sequential(
+                    torch.nn.Linear(2 * d_model, d_model),
+                    torch.nn.SiLU(inplace=False),
+                    torch.nn.Linear(d_model, d_model),
+                )
+                # Initialize output projection to zero for stable initial convergence
+                torch.nn.init.zeros_(self.latrec_mlp[-1].weight)
+                torch.nn.init.zeros_(self.latrec_mlp[-1].bias)
+            elif latrec_transfer == "identity":
+                self.latrec_mlp = None
+            else:
+                raise ValueError(
+                    f"Unsupported latrec_transfer='{latrec_transfer}'. Supported choices: ['identity', 'linear']."
+                )
+        else:
+            self.latrec_mlp = None
 
         if d_edge is not None or n_edge_types is not None:
             if None in [d_edge, n_edge_types]:
@@ -783,6 +808,7 @@ class SemlaGenerator(MolecularGenerator):
         cond_atomics=None,
         cond_bonds=None,
         atom_mask=None,
+        prev_node_latent=None,
     ):
         """Predict molecular coordinates and atom types
 
@@ -794,14 +820,10 @@ class SemlaGenerator(MolecularGenerator):
             cond_atomics (torch.Tensor): Conditional atom type logits, shape [batch_size, n_atoms, n_feats]
             cond_bonds (torch.Tensor): Cond bond type logits, shape [batch_size, n_atoms, n_atoms, n_edge_types]
             atom_mask (torch.Tensor): Mask for fake atoms, shape [batch_size, n_atoms], 1 for real atoms
+            prev_node_latent (torch.Tensor, Optional): Carried node scalar state from previous pass, shape [batch_size, n_atoms, d_model]
 
         Returns:
-            (predicted coordinates, atom type logits, bond logits, atom charges)
-            All torch.Tensor, shapes:
-                Coordinates: [batch_size, n_atoms, 3]
-                Type logits: [batch_size, n_atoms, vocab_size],
-                Bond logits: [batch_size, n_atoms, n_atoms, n_edge_types]
-                Charge logits: [batch_size, n_atoms, 7]
+            (predicted coordinates, atom type logits, bond logits, atom charges, node_latent)
         """
 
         if cond_coords is not None and not self.self_cond:
@@ -818,7 +840,6 @@ class SemlaGenerator(MolecularGenerator):
 
         # Embed the number of atoms in a mol into a small vector and concat this to inv feats for each atom
         n_atoms = atom_mask.sum(dim=-1, keepdim=True)
-        # TODO: assert that n_atoms not larger than max_atoms
         assert (n_atoms < self.size_emb.num_embeddings).all(), "n_atoms exteed Embedding Range!"
         size_emb = self.size_emb(n_atoms).expand(-1, inv_feats.size(1), -1)
         inv_feats = torch.cat((inv_feats, size_emb), dim=-1)
@@ -826,6 +847,16 @@ class SemlaGenerator(MolecularGenerator):
             inv_feats = torch.cat((inv_feats, cond_atomics), dim=-1)
 
         atom_feats = self.feat_proj(inv_feats)
+
+        # --- latent recursion: identity or linear transfer on node scalar states ---
+        if self.latent_recursion and prev_node_latent is not None:
+            if self.latrec_transfer == "identity":
+                atom_feats = atom_feats + prev_node_latent
+            elif self.latrec_transfer == "linear" and self.latrec_mlp is not None:
+                concat_feats = torch.cat((atom_feats, prev_node_latent), dim=-1)
+                atom_feats = atom_feats + self.latrec_mlp(concat_feats)
+        atom_feats = atom_feats * atom_mask.unsqueeze(-1)
+        # ---------------------------------------------------------------------------
 
         if edge_feats is not None:
             edge_feats = edge_feats.float()
@@ -845,6 +876,8 @@ class SemlaGenerator(MolecularGenerator):
         pred_coords = smolF.zero_com(pred_coords, node_mask=atom_mask)
         pred_coords = pred_coords * atom_mask.unsqueeze(-1)
 
+        node_latent = pred_feats * atom_mask.unsqueeze(-1) if self.latent_recursion else None
+
         type_logits = self.atom_classifier_head(pred_feats)
         charge_logits = self.charge_classifier_head(pred_feats)
 
@@ -852,6 +885,6 @@ class SemlaGenerator(MolecularGenerator):
         if pred_edges is not None:
             pred_edges = pred_edges + pred_edges.transpose(1, 2)
             edge_logits = self.edge_out_proj(pred_edges)
-            return pred_coords, type_logits, edge_logits, charge_logits
+            return pred_coords, type_logits, edge_logits, charge_logits, node_latent
 
-        return pred_coords, type_logits, charge_logits
+        return pred_coords, type_logits, charge_logits, node_latent

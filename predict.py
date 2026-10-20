@@ -42,7 +42,8 @@ DEFAULT_SAMPLER = "euler"
 DEFAULT_LOW_CONFIDENCE_REMASK = None
 
 def load_model(args, vocab, dm):
-    checkpoint = torch.load(args.ckpt_path)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.ckpt_path, map_location=device)
     hparams = checkpoint["hyper_parameters"]
 
     hparams["compile_model"] = False
@@ -57,6 +58,13 @@ def load_model(args, vocab, dm):
 
     if hparams["architecture"] != "semla":
         raise ValueError("Only the Semla architecture is supported; use checkpoints trained with --arch=semla.")
+
+    # Defensive read of Latent Recursion parameters from hparams or args CLI override
+    if hasattr(args, "latent_recursion") and args.latent_recursion is not None:
+        latent_recursion = args.latent_recursion
+    else:
+        latent_recursion = hparams.get("latent_recursion", False)
+    latrec_transfer = hparams.get("latrec_transfer", "identity")
 
     dynamics = EquiInvDynamics(
         hparams["d_model"],
@@ -79,6 +87,8 @@ def load_model(args, vocab, dm):
         self_cond=hparams["self_cond"],
         size_emb=hparams["size_emb"],
         max_atoms=hparams["max_atoms"],
+        latent_recursion=latent_recursion,
+        latrec_transfer=latrec_transfer,
     )
 
     type_mask_index = (
@@ -102,9 +112,11 @@ def load_model(args, vocab, dm):
         adaptive_cat_noise_level=args.adaptive_cat_noise_level,
         sampler=args.sampler,
     )
-    # Remove sampling_scheduler_factor_rho from hparams if present to avoid duplicate argument
+    # Remove keys from hparams if present to avoid duplicate keyword argument errors
     hparams.pop("sampling_scheduler_factor_rho", None)
     hparams.pop("low_confidence_remask", None)
+    hparams.pop("latent_recursion", None)
+    hparams.pop("latrec_transfer", None)
     
     # Get use_step_size_sampling: use command line argument if explicitly set, otherwise from checkpoint hparams
     if hasattr(args, 'use_step_size_sampling') and args.use_step_size_sampling is not None:
@@ -122,6 +134,8 @@ def load_model(args, vocab, dm):
         sampling_scheduler_factor_rho=args.sampling_scheduler_factor_rho,
         low_confidence_remask=args.low_confidence_remask,
         use_step_size_sampling=use_step_size_sampling,
+        latent_recursion=latent_recursion,
+        latrec_transfer=latrec_transfer,
         **hparams,
     )
     return fm_model
@@ -191,7 +205,8 @@ def build_dm(args, hparams, vocab):
 
 
 def dm_from_ckpt(args, vocab):
-    checkpoint = torch.load(args.ckpt_path)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    checkpoint = torch.load(args.ckpt_path, map_location=device)
     hparams = checkpoint["hyper_parameters"]
     dm = build_dm(args, hparams, vocab)
     return dm

@@ -186,21 +186,22 @@ def init_metrics(data_path, model, no_novelty=False):
 def generate_molecules(model, dm, steps, stabilities=False):
     test_dl = dm.test_dataloader()
     model.eval()
-    cuda_model = model.to("cuda")
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    target_model = model.to(device)
 
     outputs = []
     for batch in tqdm(test_dl):
-        batch = {k: v.cuda() for k, v in batch[0].items()}
-        output = cuda_model._generate(batch, steps)
+        batch = {k: v.to(device) for k, v in batch[0].items()}
+        output = target_model._generate(batch, steps)
         outputs.append(output)
 
-    molecules = [cuda_model._generate_mols(output) for output in outputs]
+    molecules = [target_model._generate_mols(output) for output in outputs]
     molecules = [mol for mol_list in molecules for mol in mol_list]
 
     if not stabilities:
         return molecules, outputs
 
-    stabilities = [cuda_model._generate_stabilities(output) for output in outputs]
+    stabilities = [target_model._generate_stabilities(output) for output in outputs]
     stabilities = [mol_stab for mol_stabs in stabilities for mol_stab in mol_stabs]
     return molecules, outputs, stabilities
 

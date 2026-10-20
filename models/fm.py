@@ -549,8 +549,12 @@ class MolecularCFM(L.LightningModule):
         low_confidence_remask: Optional[str] = None,
         # x_pred_mode: None (disabled), 'constant' (standard EDM preconditioning), 
         # or 'adaptive' (with adaptive identity component subtraction)
-        # Merged from use_x_pred and x_pred_type parameters
         x_pred_mode: Optional[str] = None,
+        latent_recursion: bool = False,
+        latrec_n: int = 0,
+        latrec_k: int = 1,
+        latrec_p: float = 0.5,
+        latrec_transfer: str = "identity",
         **kwargs
     ):
         super().__init__()
@@ -586,6 +590,11 @@ class MolecularCFM(L.LightningModule):
         self.pairwise_metrics = pairwise_metrics
         self.compile_model = compile_model
         self.self_condition = self_condition
+        self.latent_recursion = latent_recursion
+        self.latrec_n = latrec_n
+        self.latrec_k = latrec_k
+        self.latrec_p = latrec_p
+        self.latrec_transfer = latrec_transfer
         self.distill = distill
         self.lr_schedule = lr_schedule
         self.sampling_scheduler = sampling_scheduler
@@ -634,6 +643,11 @@ class MolecularCFM(L.LightningModule):
             "type_strategy": type_strategy,
             "bond_strategy": bond_strategy,
             "self_condition": self_condition,
+            "latent_recursion": latent_recursion,
+            "latrec_n": latrec_n,
+            "latrec_k": latrec_k,
+            "latrec_p": latrec_p,
+            "latrec_transfer": latrec_transfer,
             "distill": distill,
             "lr_schedule": lr_schedule,
             "sampling_strategy": sampling_scheduler,
@@ -695,7 +709,7 @@ class MolecularCFM(L.LightningModule):
 
         self._init_params()
 
-    def forward(self, batch, t, training=False, cond_batch=None):
+    def forward(self, batch, t, training=False, cond_batch=None, prev_node_latent=None):
         """Predict molecular coordinates and atom types
 
         Args:
@@ -703,10 +717,10 @@ class MolecularCFM(L.LightningModule):
             t (torch.Tensor): Interpolation times between 0 and 1, shape [batch_size]
             training (bool): Whether to run forward in training mode
             cond_batch (dict[str, Tensor]): Predictions from previous step, if we are using self conditioning
+            prev_node_latent (torch.Tensor, Optional): Carried node scalar state from previous pass
 
         Returns:
-            (predicted coordinates, atom type logits (unnormalised probabilities))
-            Both torch.Tensor, shapes [batch_size, num_atoms, 3] and [batch_size, num atoms, vocab_size]
+            (predicted coordinates, atom type logits, bond logits, charge logits, node_latent)
         """
         coords = batch["coords"]
         atom_types = batch["atomics"]
@@ -715,8 +729,7 @@ class MolecularCFM(L.LightningModule):
         coef = self._prepare_coef(t)
 
         input_coords = coef["c_in"].view(-1, 1, 1)*coords
-        # print('input_coords Var',torch.var(input_coords[0]))
-        
+
         # Prepare invariant atom features
         times = coef["c_noise"].view(-1, 1, 1).expand(-1, coords.size(1), -1)
         features = torch.cat((times, atom_types), dim=2)
@@ -733,23 +746,20 @@ class MolecularCFM(L.LightningModule):
                 cond_coords=cond_batch["coords"],
                 cond_atomics=cond_batch["atomics"],
                 cond_bonds=cond_batch["bonds"],
-                atom_mask=mask
+                atom_mask=mask,
+                prev_node_latent=prev_node_latent,
             )
 
         else:
-            net_out = model(input_coords, features, edge_feats=bonds, atom_mask=mask)
-        output_coords, output_types, output_bonds, output_charges = net_out
+            net_out = model(
+                input_coords, features, edge_feats=bonds, atom_mask=mask, prev_node_latent=prev_node_latent
+            )
+        output_coords, output_types, output_bonds, output_charges, node_latent = net_out
         
         # Apply x-prediction mode if enabled
-        # 'constant': Standard EDM preconditioning - subtract input coords directly
-        # 'adaptive': Adaptive identity component subtraction using αt = σd*t/(σd² + t²)
-        # This reduces residual correlation with input and aligns with network's inductive bias
         if self.x_pred_mode == 'constant':
-            # Standard EDM: Dθ(xt; t) = cskip*xt + cout*(Fθ(cin*xt; cnoise) - cin*xt)
             output_coords = output_coords - input_coords
         elif self.x_pred_mode == 'adaptive':
-            # Adaptive: Dθ(xt; t) = cskip*xt + cout*(Fθ(cin*xt; cnoise) - αt*cin*xt)
-            # where αt = σd*t/(σd² + t²) is the optimal LMMSE coefficient
             x_pred_coef = self.sigma_data*t/(self.sigma_data**2 + t**2)
             output_coords = output_coords - x_pred_coef.view(-1, 1, 1)*input_coords
         elif self.x_pred_mode is not None:
@@ -757,9 +767,11 @@ class MolecularCFM(L.LightningModule):
         
         coords = output_coords*coef["c_out"].view(-1, 1, 1) + coords*coef["c_skip"].view(-1, 1, 1)
 
-        return coords, output_types, output_bonds, output_charges
+        return coords, output_types, output_bonds, output_charges, node_latent
+
     def training_step(self, batch, b_idx):
         return self._training_step(batch, b_idx)
+
     def _get_initial_cond_batch(self, interpolated):
         """Initialize conditioning batch with zeros"""
         return {
@@ -767,10 +779,11 @@ class MolecularCFM(L.LightningModule):
             "atomics": torch.zeros_like(interpolated["atomics"]),
             "bonds": torch.zeros_like(interpolated["bonds"])
         }
+
     def _generate_self_condition(self, interpolated, times, cond_batch):
         """Generate self conditioning batch"""
         with torch.no_grad():
-            cond_coords, cond_types, cond_bonds, _ = self(
+            cond_coords, cond_types, cond_bonds, _, _ = self(
                 interpolated, times, training=True,
                 cond_batch=cond_batch
             )
@@ -780,23 +793,42 @@ class MolecularCFM(L.LightningModule):
                 "atomics": F.softmax(cond_types, dim=-1),
                 "bonds": F.softmax(cond_bonds, dim=-1)
             }
+
     def _training_step(self, batch, b_idx):
         current_epoch = self.trainer.current_epoch
         prior, data, interpolated, times = batch
-        # data is the true data, interpolated is the noisy data, difference is computed between the predicted and the true data
 
         # If training with self conditioning, half the time generate a conditional batch by setting cond to zeros
         cond_batch = self._get_initial_cond_batch(interpolated) if self.self_condition else None
-        # Apply self conditioning
         if self.self_condition and torch.rand(1).item() > 0.5:
             cond_batch = self._generate_self_condition(interpolated, times, cond_batch)
 
-        
-        coords, types, bonds, charges = self(
+        # --- latent recursion chain ---
+        node_latent = None
+        if self.latent_recursion and torch.rand(1).item() < self.latrec_p:
+            if self.latrec_k > 0:
+                with torch.no_grad():
+                    for _ in range(self.latrec_k):
+                        *_, node_latent = self(
+                            interpolated, times, training=True,
+                            cond_batch=cond_batch, prev_node_latent=node_latent,
+                        )
+                if node_latent is not None:
+                    node_latent = node_latent.detach()
+
+            for _ in range(self.latrec_n):
+                *_, node_latent = self(
+                    interpolated, times, training=True,
+                    cond_batch=cond_batch, prev_node_latent=node_latent,
+                )
+
+        # --- final tracked pass producing the loss ---
+        coords, types, bonds, charges, _ = self(
             interpolated,
             times,
             training=True,
-            cond_batch=cond_batch
+            cond_batch=cond_batch,
+            prev_node_latent=node_latent,
         )
         predicted = {
             "coords": coords,
@@ -1094,6 +1126,7 @@ class MolecularCFM(L.LightningModule):
         print(f"Time taken for time schedule: {time_end - time_start} seconds")
         time_start = time.time()
         cond_batch = self._get_initial_cond_batch(prior) if self.self_condition else None
+        node_latent = None
         with torch.no_grad():
             
             for t_idx, step_size in enumerate(step_sizes):
@@ -1107,7 +1140,9 @@ class MolecularCFM(L.LightningModule):
                     step_size += (times_hat[0].item() - times[0].item())
                     curr = self._interpolate_with_noise(curr, times, times_hat)
 
-                coords, type_logits, bond_logits, charge_logits = self(curr, times_hat, training=False, cond_batch=cond)
+                coords, type_logits, bond_logits, charge_logits, node_latent = self(
+                    curr, times_hat, training=False, cond_batch=cond, prev_node_latent=node_latent
+                )
                 times = times_hat - step_size
                 times = torch.clamp(times, min=1e-6)
                 type_probs = F.softmax(type_logits/self.integrator.temperature, dim=-1)
