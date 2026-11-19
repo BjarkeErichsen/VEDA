@@ -39,7 +39,7 @@
 \newcommand{\sg}{\mathrm{sg}}
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{Latent Recursion in VEDA-S\\\large Design document v4: results, design space, and a proposed training method}
+\title{Latent Recursion in VEDA-S\\\large Design document v5: results, design space, and a proposed training method}
 \author{Bjarke L.\,V.\,B.\ Erichsen}
 \date{\today}
 
@@ -51,8 +51,9 @@
 \section{Status}
 
 Working configuration: \code{node\_edge\_e1\_lin\_res}, $K{=}6$, $n{=}6$, with
-self-conditioning (SC). It beats SC alone at equal layer count on both QM9 and
-GEOM-Drugs. Open: (i) a better training method, (ii) a mechanism for the coordinate
+self-conditioning (SC). Against a hyperparameter-matched SC baseline at 2 layers on
+GEOM-Drugs it raises validity $0.548 \to 0.819$ for $+5.9\%$ parameters, at
+$10\times$ the cost per optimizer step. Open: (i) a better training method, (ii) a mechanism for the coordinate
 channel. Sections~\ref{sec:mech}--\ref{sec:results} record what exists;
 Section~\ref{sec:main} is the main proposal; Section~\ref{sec:coords} the coordinate
 channel; Section~\ref{sec:secondary} everything else.
@@ -98,61 +99,103 @@ is plain end-to-end training of a 7-pass weight-tied network.
 % ======================================================================
 \section{Results to date}\label{sec:results}
 
-Values read off the W\&B plots; treat as approximate. ``$a \to b$'' is the value at
-0.4M and at 1.3M steps.
+Final logged values from the W\&B export of \code{vernerbruhn/equinv-geom-drugs},
+2026-11-19. Parameter counts are halved from the logged \code{num\_parameters}, which
+double-counts because \code{ema\_gen} is a submodule of \code{MolecularCFM}; the halved
+figures are the real model sizes.
 
-\begin{center}
-\begin{tabular}{lcccc}
+\begin{center}\small
+\begin{tabular}{llrrrrr}
 \toprule
-GEOM-Drugs & validity & fc-validity & mol.\ stability & opt-rmsd \\
+Run & cfg & params & steps & hours & s/step & validity \\
 \midrule
-2 layers, no SC, no LR        & 0.15 & 0.05 & 0.25--0.30 & --- \\
-2 layers, SC                  & 0.55--0.60 & $0.30 \to 0.45$ & $0.80 \to 0.87$ & $\sim$1.3 \\
-\textbf{2 layers, SC + LR} (0.4M) & \textbf{0.70--0.80} & \textbf{0.50--0.60} & 0.80--0.85 & $\sim$1.2 \\
-3 layers, SC (0.35M)          & $\sim$0.70 & & & $\sim$1.25 \\
-6 layers, SC (0.2M)           & $\sim$0.85 & & & $\sim$1.12 \\
-12 layers, SC (0.13M)         & $\sim$0.85 & $\sim$0.75 & $\sim$0.88 & $\sim$1.03 \\
+2L, no SC, no LR        & B$^\dagger$ & 5.58\,M & 560\,k & 23.9 & 0.15 & 0.174 \\
+2L, SC                  & B & 5.59\,M & 1\,345\,k & 81.7 & 0.219 & 0.548 \\
+\textbf{2L, SC + LR}    & \textbf{B} & \textbf{5.92\,M} & \textbf{407\,k} & \textbf{246.7} & \textbf{2.185} & \textbf{0.819} \\
+\midrule
+2L, SC                  & A & 5.59\,M & 679\,k & 540.1 & 2.86 & 0.580 \\
+3L, SC                  & A & 7.36\,M & 365\,k & 23.8 & 0.235 & 0.728 \\
+6L, SC                  & A & 12.67\,M & 238\,k & 23.9 & 0.361 & 0.866 \\
+12L, SC                 & A & --- & 137\,k & 23.9 & 0.625 & 0.857 \\
 \bottomrule
 \end{tabular}
 
 \smallskip
-\begin{tabular}{lcc}
+\begin{tabular}{lrrrrrrr}
 \toprule
-QM9 & validity & opt-rmsd \\
+Run & validity & fc-val. & mol.stab. & atom stab. & opt-rmsd & strain/at. & train loss \\
 \midrule
-2 layers, no SC, no LR & 0.83 & 0.68 \\
-2 layers, SC           & 0.97--0.99 & 0.39 \\
-2 layers, LR only      & 0.97--0.99 & 0.36 \\
-2 layers, SC + LR      & 0.97--0.99 & $\sim$0.39 (short run) \\
-12 layers, SC          & 0.97--0.99 & 0.27 \\
+2L, no SC, no LR     & 0.174 & 0.067 & 0.274 & 0.963 & 1.289 & 12.44 & 0.593 \\
+2L, SC               & 0.548 & 0.463 & \textbf{0.881} & 0.988 & 1.301 & \textbf{3.49} & 0.680 \\
+\textbf{2L, SC + LR} & \textbf{0.819} & \textbf{0.604} & 0.798 & \textbf{0.991} & \textbf{1.254} & 6.12 & 0.388 \\
+\midrule
+2L, SC (cfg A)       & 0.580 & 0.483 & 0.824 & 0.982 & 1.281 & 4.91 & 0.564 \\
+3L, SC               & 0.728 & 0.594 & 0.894 & 0.988 & 1.229 & 3.78 & 0.495 \\
+6L, SC               & 0.866 & 0.772 & 0.952 & 0.993 & 1.124 & 2.19 & 0.438 \\
+12L, SC              & 0.857 & 0.740 & 0.891 & 0.993 & 1.024 & 1.61 & 0.358 \\
 \bottomrule
 \end{tabular}
 \end{center}
 
-\begin{itemize}
-  \item \textbf{GEOM is where the effect is.} LR at 0.4M steps beats SC at 1.3M steps
-        on validity ($\sim$0.75 vs $\sim$0.57), fc-validity (0.6 vs 0.45) and
-        energy-validity (0.8 vs 0.55). The LR run is roughly 2.5--5$\times$ slower per
-        step, so that is about matched wall-clock: the gain is not only speed. With
-        0.33M extra parameters the 2-layer model lands between the 3- and 6-layer SC
-        models on validity.
-  \item \textbf{Molecule stability is the exception.} SC gets to $\sim$0.87 given
-        enough steps; LR sits at 0.80--0.85.
-  \item \textbf{QM9 is saturated} on validity (the discrete heads are solved at 2
-        layers); only opt-rmsd separates, slightly.
-  \item \textbf{Cost.} Per parameter and per \emph{inference} pass LR wins (inference is
-        still one pass per step). Per \emph{training} hour the 3- and 6-layer models are
-        ahead.
-  \item \textbf{Train loss is flattering.} \code{train-type-loss} drops from 0.105 (SC)
-        to 0.08 (LR), but it is measured after 6 or 12 same-$\sigma$ refinement passes,
-        i.e.\ on a 14- or 26-layer weight-tied network. Inference gets one pass per step.
-  \item \textbf{Not usable as they stand.} \code{val-energy} and
-        \code{val-energy-per-atom} average over valid molecules only, and LR validates
-        $\sim$40\% more of them (use median on the intersection,
-        Appendix~\ref{app:metrics}). \code{val-fcd-score} reads a constant $10^6$ for
-        most runs, which looks like a failure value. \code{val-novelty} is $\approx 1$
-        everywhere.
-\end{itemize}
+\noindent
+cfg~A: \code{batch-cost} 4096, \code{warm\_up\_steps} 10000, \code{x\_pred\_mode}
+\code{adaptive}, \code{bond\_loss\_weight} 1.0.\quad
+cfg~B: 2048, 2000, \code{constant}, 0.5.\quad
+$^\dagger$B but \code{batch-cost} 4096.
+
+\paragraph{The comparison that is clean.} The top block is one matched pair: ``2L, SC''
+and ``2L, SC\,+\,LR'' share every hyperparameter and both ran on A100.
+\textbf{Validity 0.548 $\to$ 0.819, fc-validity 0.463 $\to$ 0.604, opt-rmsd 1.301 $\to$
+1.254, for $+328{,}192$ parameters ($+5.9\%$).} That delta is exactly
+$\mathrm{Linear}(768,384)+\mathrm{Linear}(256,128)$ with biases, so the mechanism is
+the only difference.
+
+\paragraph{The comparison that is not.} The layer-count runs are cfg~A and differ from
+the LR run in four hyperparameters at once, \code{x\_pred\_mode} among them. ``2-layer
+LR lands between 3 and 6 layers'' ($0.819$ vs $0.728$ and $0.866$) is therefore
+suggestive, not established. A cfg~B 3-layer run would settle it and is cheap.
+
+\paragraph{Cost: $10\times$ per step, measured.} The matched pair gives
+$2.185$ vs $0.219$ s/step, a factor $9.99$. Earlier estimates of 2.5--5$\times$ from
+plot-reading were wrong, and so was the claim that the two runs were at comparable
+wall-clock: LR used $246.7$\,h against $81.7$\,h, three times as much. (The other s/step
+figures are not comparable --- hardware and \code{batch-cost} both vary.)
+
+\paragraph{The plateau argument survives anyway.} Two independent 2-layer SC runs, under
+different configs and for 81.7\,h and 540.1\,h, reach $0.548$ and $0.580$. 540 hours of
+2-layer self-conditioning does not get past $0.58$; 247 hours of 2-layer SC\,+\,LR
+reaches $0.819$. The ceiling moves, not just the speed. This is the one claim in this
+section that does not depend on cost accounting.
+
+\paragraph{Molecule stability is the exception, and it is real.} LR has the \emph{best}
+atom stability of any 2-layer run ($0.991$) and the \emph{worst} molecule stability
+($0.798$ against $0.881$). Molecule stability needs every atom in a sample to pass, so
+this says LR's remaining per-atom errors are spread across more molecules rather than
+concentrated in a few. Worth a direct check: the distribution of per-molecule unstable-atom
+counts, not just the two means.
+
+\paragraph{Energy and strain are consistent with the selection effect.} LR looks much
+worse (strain-per-atom $6.12$ vs $3.49$). But these averages run over the molecules each
+model manages to build, and LR builds $0.819$ of them against $0.548$. For LR's extra
+$0.271$ to produce the observed mean, those marginal molecules would need
+strain-per-atom
+\[
+  \frac{0.819\times 6.12 - 0.548\times 3.49}{0.271} \;\approx\; 11.4,
+\]
+against $12.44$ measured for the no-SC model --- i.e.\ about what the hardest molecules
+score. The gap is explained by LR validating molecules its baseline simply fails to
+build. (Indicative only: strain's denominator is ``built and optimisable'', not validity
+exactly.) Report median strain on the intersection before drawing any conclusion here.
+
+\paragraph{Metrics to stop logging as they stand.} \code{val-fcd-score} is $10^6$ for
+every cfg~A run and \code{NaN} for the LR run --- a sentinel, not a measurement.
+\code{val-uniqueness} is exactly $1.000$ and \code{val-novelty} is $0.998$--$1.000$
+everywhere; neither separates anything.
+
+\paragraph{Train loss is flattering.} $0.388$ (LR) against $0.680$ (SC), but the LR
+figure is read after 6 or 12 same-$\sigma$ refinement passes, i.e.\ off a 14- or
+26-layer weight-tied network, while inference gets one pass per step. The gap
+measurement of \S\ref{sec:gap} quantifies what that is worth.
 
 % ======================================================================
 \section{Design space}\label{sec:space}
@@ -208,8 +251,9 @@ This one picture accounts for most of what has been observed:
   \item \emph{The latent adds computation, not information.} The ideal denoiser is a
         function of $(x_t,\sigma)$ alone; the carry is a warm start (the fixed-point-flows
         paper says the same: the coupling to the carried state is ``a byproduct of warm
-        starts''). That is why LR makes 2 layers behave like 4, and it constrains
-        which training couplings are legitimate (\S\ref{sec:leak}).
+        starts''). That is why 2 layers plus LR reach the validity of 3--6 layers
+        without it, and it constrains which training couplings are legitimate
+        (\S\ref{sec:leak}).
 \end{itemize}
 
 \textbf{The gap this exposes.} Training asks one question: after 6 or 12 passes on the
