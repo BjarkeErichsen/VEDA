@@ -1,0 +1,628 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=2.3cm]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\definecolor{codegray}{gray}{0.95}
+\definecolor{commentgreen}{rgb}{0.25,0.45,0.25}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codegray},
+  commentstyle=\color{commentgreen}\itshape,
+  keywordstyle=\bfseries,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=none,
+  xleftmargin=0.5em,
+  showstringspaces=false,
+  language=Python,
+}
+\setlist{leftmargin=*,itemsep=2pt,topsep=3pt}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\zs}{z^{s}}
+\newcommand{\ze}{z^{e}}
+\newcommand{\zv}{z^{v}}
+\newcommand{\xh}{\hat{x}_0}
+\newcommand{\xhat}[1]{\hat{x}_{0,#1}}
+\newcommand{\sg}{\mathrm{sg}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{Latent Recursion in VEDA-S\\\large Design document v4: results, design space, and a proposed training method}
+\author{Bjarke L.\,V.\,B.\ Erichsen}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+% ======================================================================
+\section{Status}
+
+Working configuration: \code{node\_edge\_e1\_lin\_res}, $K{=}6$, $n{=}6$, with
+self-conditioning (SC). It beats SC alone at equal layer count on both QM9 and
+GEOM-Drugs. Open: (i) a better training method, (ii) a mechanism for the coordinate
+channel. Sections~\ref{sec:mech}--\ref{sec:results} record what exists;
+Section~\ref{sec:main} is the main proposal; Section~\ref{sec:coords} the coordinate
+channel; Section~\ref{sec:secondary} everything else.
+
+% ======================================================================
+\section{Current method}\label{sec:mech}
+
+\paragraph{Mechanism.} Carry node and edge state, not coordinates.
+\begin{align*}
+  \zs &= \code{pred\_feats}\odot\code{atom\_mask} && \text{after \code{feat\_norm}, } [B,N,384]\\
+  \ze &= (\code{pred\_edges}+\code{pred\_edges}^{\top})\odot\code{pair\_mask} && \text{after \code{bond\_norm}, } [B,N,N,128]
+\end{align*}
+Both are tapped before their readout heads. Injected after \code{feat\_proj} and after
+\code{edge\_in\_proj} respectively, both by
+\[
+  h \leftarrow h + W\,[\,h \,\|\, h - h_{\text{prev}}\,], \qquad W \text{ zero-initialised (with bias).}
+\]
+Added parameters: $768{\times}384 + 256{\times}128 \approx 0.33$M (a core layer is
+roughly 1.8M).
+
+\paragraph{Training.} Algorithm~\ref{alg:current}, as run for the experiments below
+(the copy of \code{fm.py} on the remote still has the older version, where $p$ gated
+the whole chain). $p$ switches only the untracked warm-up; the $n$ tracked passes
+always run. All passes see the same $(x_t,\sigma)$; one loss, on the last pass; the SC
+batch $c$ is computed once by a latent-free pass and held fixed for the whole chain.
+
+\begin{algorithm}[h]
+\caption{Current training step}\label{alg:current}
+\begin{algorithmic}[1]
+  \State $c \gets \mathbf{0}$;\quad with prob.\ $\tfrac12$: $c \gets \sg\,f_\theta(x_t,\sigma,\mathbf{0},\varnothing)$ \Comment{self-conditioning pass}
+  \State $z \gets \varnothing$
+  \State \textbf{if} $u<p$: \textbf{for} $k=1..K$: $z \gets \sg\,f_\theta(x_t,\sigma,c,z)$ \Comment{untracked; the only part $p$ gates}
+  \State \textbf{for} $i=1..n$: $z \gets f_\theta(x_t,\sigma,c,z)$ \Comment{tracked, always}
+  \State $\hat y \gets f_\theta(x_t,\sigma,c,z)$;\quad \textbf{return} $\mathcal L(\hat y, x_0,\sigma)$
+\end{algorithmic}
+\end{algorithm}
+
+At $K{=}n{=}6$, $p{=}0.5$, per optimizer step: $0.5 + pK + n + 1 = 10.5$ forward passes
+expected, $n+1 = 7$ of them tracked every time, for \emph{one} supervised prediction.
+That prediction always has 6 or 12 passes of context behind it. On the cold branch this
+is plain end-to-end training of a 7-pass weight-tied network.
+
+% ======================================================================
+\section{Results to date}\label{sec:results}
+
+Values read off the W\&B plots; treat as approximate. ``$a \to b$'' is the value at
+0.4M and at 1.3M steps.
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+GEOM-Drugs & validity & fc-validity & mol.\ stability & opt-rmsd \\
+\midrule
+2 layers, no SC, no LR        & 0.15 & 0.05 & 0.25--0.30 & --- \\
+2 layers, SC                  & 0.55--0.60 & $0.30 \to 0.45$ & $0.80 \to 0.87$ & $\sim$1.3 \\
+\textbf{2 layers, SC + LR} (0.4M) & \textbf{0.70--0.80} & \textbf{0.50--0.60} & 0.80--0.85 & $\sim$1.2 \\
+3 layers, SC (0.35M)          & $\sim$0.70 & & & $\sim$1.25 \\
+6 layers, SC (0.2M)           & $\sim$0.85 & & & $\sim$1.12 \\
+12 layers, SC (0.13M)         & $\sim$0.85 & $\sim$0.75 & $\sim$0.88 & $\sim$1.03 \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\begin{tabular}{lcc}
+\toprule
+QM9 & validity & opt-rmsd \\
+\midrule
+2 layers, no SC, no LR & 0.83 & 0.68 \\
+2 layers, SC           & 0.97--0.99 & 0.39 \\
+2 layers, LR only      & 0.97--0.99 & 0.36 \\
+2 layers, SC + LR      & 0.97--0.99 & $\sim$0.39 (short run) \\
+12 layers, SC          & 0.97--0.99 & 0.27 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+  \item \textbf{GEOM is where the effect is.} LR at 0.4M steps beats SC at 1.3M steps
+        on validity ($\sim$0.75 vs $\sim$0.57), fc-validity (0.6 vs 0.45) and
+        energy-validity (0.8 vs 0.55). The LR run is roughly 2.5--5$\times$ slower per
+        step, so that is about matched wall-clock: the gain is not only speed. With
+        0.33M extra parameters the 2-layer model lands between the 3- and 6-layer SC
+        models on validity.
+  \item \textbf{Molecule stability is the exception.} SC gets to $\sim$0.87 given
+        enough steps; LR sits at 0.80--0.85.
+  \item \textbf{QM9 is saturated} on validity (the discrete heads are solved at 2
+        layers); only opt-rmsd separates, slightly.
+  \item \textbf{Cost.} Per parameter and per \emph{inference} pass LR wins (inference is
+        still one pass per step). Per \emph{training} hour the 3- and 6-layer models are
+        ahead.
+  \item \textbf{Train loss is flattering.} \code{train-type-loss} drops from 0.105 (SC)
+        to 0.08 (LR), but it is measured after 6 or 12 same-$\sigma$ refinement passes,
+        i.e.\ on a 14- or 26-layer weight-tied network. Inference gets one pass per step.
+  \item \textbf{Not usable as they stand.} \code{val-energy} and
+        \code{val-energy-per-atom} average over valid molecules only, and LR validates
+        $\sim$40\% more of them (use median on the intersection,
+        Appendix~\ref{app:metrics}). \code{val-fcd-score} reads a constant $10^6$ for
+        most runs, which looks like a failure value. \code{val-novelty} is $\approx 1$
+        everywhere.
+\end{itemize}
+
+% ======================================================================
+\section{Design space}\label{sec:space}
+
+Your table, compressed, with the closest prior work and where each idea stands here.
+
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}l Y Y Y@{}}
+\toprule
+ & Idea & Closest prior work & Status here \\
+\midrule
+1 & SC-style carry, no BPTT ($K{=}1,n{=}0$) & RIN latent self-conditioning; Loopholing & tested; weakest \\
+2 & Re-use computation $\Rightarrow$ fewer layers & implicit ML force fields (warm-started fixed point, 2--5$\times$) & GEOM 2-layer result \\
+3 & BPTT: latent optimised for future steps & Relay (TBPTT, horizon 2); MetaState & $n{\ge}1$ helps \\
+4 & Train like inference: update $t$, update $x_t$, long trajectories & MetaState ($K$-step unroll along the reveal schedule); FPF (on-policy carry) & \textbf{untested} $\rightarrow$ \S\ref{sec:main} \\
+5 & What to backprop through (latent only, or also the integrator) & --- & untested \\
+6 & Loss at every step & TRM deep supervision; MetaState & \textbf{untested} $\rightarrow$ \S\ref{sec:main} \\
+7 & Same-$(x_t,t)$ recursion with BPTT; hierarchical inference & TRM; DEQ / Jacobian-free backprop; FPF & current training; multi-level inference was null \\
+8 & Learning-rate scaling $1/n$ & --- & see note in \S\ref{sec:cost} \\
+9 & Tiny models that need many passes; loss only after warm-up & TRM & the context floor $m_0$, \S\ref{sec:main} \\
+10 & Looped layers inside one pass & Looped Diffusion LMs & control, \S\ref{sec:secondary} \\
+11 & Iterate to a fixed point, adaptive depth & Fixed-point flows; DEQuiformer & later (inference) \\
+12 & Residual-style gradient path between steps & --- & \code{lin\_res} is this \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% ======================================================================
+\section{A working picture: tracking a moving fixed point}\label{sec:picture}
+
+Write one network pass as $(\hat y, z') = F_\theta(x,\sigma,z)$. For fixed $(x,\sigma)$,
+iterating $z \leftarrow F_\theta(x,\sigma,z)$ heads to a fixed point $z^\star(x,\sigma)$.
+
+\begin{itemize}
+  \item \textbf{Current training} is the implicit-model recipe: half the time $K$
+        untracked iterations to get near $z^\star$, then always $n$ tracked ones, loss
+        on the readout of the last.
+  \item \textbf{Inference} does one iteration per $\sigma$-step, warm-started from the
+        neighbouring step. It tracks a slowly moving fixed point, always a little
+        behind: lag $\approx$ drift per step$/(1-\rho)$ for contraction rate $\rho$.
+\end{itemize}
+
+This one picture accounts for most of what has been observed:
+\begin{itemize}
+  \item \emph{$K{>}1$ helps.} Carries must come from the model's own multi-pass
+        dynamics. This is exactly the finding of Fixed-Point Forcing: one-pass carries
+        give exposure bias and the recursion settles at wrong fixed points.
+  \item \emph{Multi-level inference was null.} The carried latent is already near
+        $z^\star$; an extra same-$\sigma$ iteration is worth about as much as a smaller
+        $\Delta\sigma$.
+  \item \emph{More sampling steps help LR more than vanilla} (thesis table). Smaller
+        drift per step, smaller lag.
+  \item \emph{The latent adds computation, not information.} The ideal denoiser is a
+        function of $(x_t,\sigma)$ alone; the carry is a warm start (the fixed-point-flows
+        paper says the same: the coupling to the carried state is ``a byproduct of warm
+        starts''). That is why LR makes 2 layers behave like 4, and it constrains
+        which training couplings are legitimate (\S\ref{sec:leak}).
+\end{itemize}
+
+\textbf{The gap this exposes.} Training asks one question: after 6 or 12 passes on the
+\emph{same} input, is the readout good? Inference asks a different one: given a latent
+made one step ago at a \emph{noisier} input, is the readout good after a single pass?
+And seven passes sit in the autograd graph at every step while six of their
+predictions are thrown away.
+
+% ======================================================================
+\section{What actually changes between two inference passes}\label{sec:gap}
+
+Current training holds all of these fixed. From \code{\_generate}, between the pass
+that produces the latent and the pass that consumes it:
+
+\begin{center}
+\begin{tabularx}{\textwidth}{@{}l Y l@{}}
+\toprule
+Change & What happens at inference & In training \\
+\midrule
+(A) $\sigma$ & decreases one schedule step; \code{c\_noise}$=\log\sigma/4$ shifts & fixed \\
+(B) coordinates & $x \mathrel{+}= \Delta\,(\xh - x)/\sigma$: drift \emph{toward the model's own prediction} & fixed \\
+(B$'$) churn & fresh noise added when $\sigma\in[0.03,3]$ & absent \\
+(C) discrete sites & a fraction unmasked by \emph{sampling} from the predicted distribution; irreversible & none ever revealed \\
+(D) \code{cond\_batch} & refreshed from the latest, latent-informed prediction & frozen after one cold pass \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\paragraph{(A) is staleness.} The walk in \S\ref{sec:main} fixes it, leak-free and at
+no extra cost.
+
+\paragraph{(B) is exposure bias, and LR amplifies it.} At inference $x_{i+1}$ has
+already been dragged toward $\xh^{(i)}$ --- the very thing the latent encodes. If that
+prediction was bad, the state now sits off the noising manifold \emph{in the direction
+of the model's own error}. Teacher-forced training (including the walk below) never
+produces such a state: $x^{(i+1)}$ is a clean noising of $x_0$ however badly the model
+did. Every diffusion model has this mismatch; LR makes it sharper, because a past
+mistake is carried forward explicitly in the latent instead of only implicitly through
+$x_t$ where the schedule contracts it. Plausibly why LR-without-SC is unstable on GEOM.
+Note (B$'$) partly rescues teacher-forcing in $\sigma\in[0.03,3]$, since inference
+re-noises there too.
+
+\paragraph{(C) is the largest, and the cheapest to fix.} \code{\_mask\_sampling\_step}
+commits sites by sampling from the predicted distribution, and in the mask formulation
+they never revert. So at inference some sites have just collapsed from a distribution
+to a hard value; that value may contradict what the latent believed; and the model must
+update its remaining beliefs conditioned on it. Current training reveals \emph{nothing}
+across the whole chain, so the model never experiences a commitment event. A
+teacher-forced walk would reveal from ground truth --- always correct, so it would
+never see a \emph{wrong} commitment.
+
+This matters most because validity is purely a discrete-head metric
+(\code{mol is None} $\Leftrightarrow$ sanitisation fails on the predicted
+type/bond/charge graph), and validity is where LR is winning on GEOM.
+
+\textbf{The fix: reveal from the model's own samples, not from $x_0$.} The loss
+machinery already supports it --- \code{\_type\_loss} and \code{\_bond\_loss} restrict
+to sites masked in \code{interpolated}:
+\begin{lstlisting}
+masked_types = argmax(interpolated["atomics"]) == type_mask_index
+type_loss = type_loss * masked_types
+\end{lstlisting}
+so self-revealing automatically moves the loss onto the still-masked sites and leaves
+the target valid. Coordinates regress to $x_0$ as before. Nothing else changes.
+
+\paragraph{Order of attack.} (A) then (C) then (B). (B) last because it is the one that
+breaks the regression target: regressing to $x_0$ from a state that is no longer a
+noising of $x_0$. The standard mitigation is scheduled sampling --- on-policy with
+probability $\rho$, ramped during training.
+
+\paragraph{Measure the gap before changing anything.} No retraining. On validation data
+at fixed $\sigma$, compare the $\xh$ loss under three protocols:
+\begin{enumerate}[label=P\arabic*.]
+  \item fixed $x_t$, 6 passes --- the training configuration;
+  \item cold start, 1 pass;
+  \item latent carried from a genuine previous inference step (run the real loop from a
+        noised validation molecule).
+\end{enumerate}
+P1 $\ll$ P3 is the size of the gap, in loss units. P2 vs P3 says how much the carried
+latent is actually buying in the deployment regime: if P3 $\approx$ P2 the latent is not
+surviving the transition and (A)+(C) are urgent; if P3 $\ll$ P2 it is surviving and the
+gap is smaller than feared.
+
+% ======================================================================
+\section{Main proposal: walk $\sigma$ along the tracked chain and supervise it}\label{sec:main}
+
+Keep $K$, $n$, $p$, the pass count, the graph and the single optimizer step. Change
+only what the tracked passes see and what they are asked.
+
+\begin{algorithm}[h]
+\caption{Proposed training step}\label{alg:traj}
+\begin{algorithmic}[1]
+  \State sample $\sigma_0$; take consecutive schedule points $\sigma_0>\sigma_1>\dots>\sigma_n$
+  \State build a forward-Markov path, clean end first:
+         $x^{(n)} = x_0+\sigma_n\varepsilon$,\;
+         $x^{(i-1)} = x^{(i)} + \sqrt{\sigma_{i-1}^2-\sigma_i^2}\;\xi_i$;\; masks nested
+  \State carry $c \gets \mathbf 0$, \quad $c = (\zs,\ze,\xh,p_{\text{type}},p_{\text{bond}})$
+  \State \textbf{if} $u<p$: \textbf{repeat} $K$ times: $c \gets \sg\,F_\theta(x^{(0)},\sigma_0,c)$ \Comment{untracked warm-up, as today}
+  \State \textbf{for} $i=0..n$: $(\hat y_i, c) \gets F_\theta(x^{(i)},\sigma_i,c)$ \Comment{tracked, as today, but stepping down $\sigma$}
+  \State $S \gets \{\, i : \text{passes before pass } i \;\ge\; m_0 \,\}$ \Comment{context floor}
+  \State \textbf{return} $\tfrac{1}{|S|}\sum_{i\in S}\lambda(\sigma_i)\,\ell(\hat y_i,x_0)$
+\end{algorithmic}
+\end{algorithm}
+
+Three changes against Algorithm~\ref{alg:current}:
+\begin{enumerate}[label=(\alph*)]
+  \item the tracked passes step down the sampling schedule instead of repeating $(x_t,\sigma)$;
+  \item every tracked pass with at least $m_0$ passes behind it gets a loss;
+  \item the SC inputs are the previous pass's outputs (detached), not a frozen cold pass.
+\end{enumerate}
+Default $m_0 = n = 6$: on the cold branch only the last pass qualifies, which is today's
+loss; on the warm branch all seven do. Four supervised predictions per step on average,
+for the same compute. Adding self-sampled reveals (\S\ref{sec:gap}) on top is the
+natural second increment.
+
+\subsection{Why this should work}
+
+\begin{enumerate}
+  \item \textbf{The supervision is free.} The seven tracked passes and their readouts
+        are already computed and already in the graph. (b) adds loss evaluations and
+        nothing else.
+  \item \textbf{Shorter gradient paths.} Each pass gets a direct gradient instead of
+        one that has travelled through up to six further passes. Deep supervision is
+        what keeps weight-tied recursion trainable in TRM, and looped models report
+        instability growing with loop count. It may be the fix for LR-without-SC being
+        unstable on GEOM.
+  \item \textbf{Every supervised pass is in the deployment state}: a latent made at
+        the noisier neighbour, one pass, readout. The fixed-$\sigma$ chain trains
+        refinement in place, which inference never does, and which bought nothing when
+        it was tried (multi-level inference).
+  \item \textbf{BPTT says what it was meant to say.} The gradient from pass $i{+}1$'s
+        loss into pass $i$ is literally ``make a latent the next, less noisy step can
+        use''. Depth 6 is kept, so nothing is given up if deep BPTT is what small
+        models need (the thesis held $(n{+}1)\times$layers constant).
+  \item \textbf{Self-conditioning moves inside the chain.} Today $c$ comes from one
+        latent-free pass and is frozen for up to 13 passes, while at inference it is
+        refreshed every step by a latent-informed pass. With the carry
+        $c=(\zs,\ze,\xh,p_{\text{type}},p_{\text{bond}})$ training matches inference,
+        and the separate SC pass and its coin flip disappear.
+  \item \textbf{It has precedent on the half of VEDA that decides validity.} Relay
+        trains a carried per-token latent in masked diffusion with truncated BPTT at
+        horizon 2; MetaState unrolls $K$ denoising steps along the reveal schedule with
+        a loss at every step and BPTT, and reports that both the recurrence and the
+        BPTT matter. Atom types and bonds in VEDA are masked discrete diffusion.
+\end{enumerate}
+
+\subsection{The path must be forward-Markov, or the latent leaks $x_0$}\label{sec:leak}
+
+How consecutive inputs $x^{(i-1)},x^{(i)}$ are coupled matters more than it looks.
+\begin{itemize}
+  \item \textbf{Shared noise}, $x^{(i)}=x_0+\sigma_i\varepsilon$: two points fix the
+        line, so a latent that remembers the previous geometry gives $x_0$ exactly. At
+        inference the same extrapolation only returns the previous prediction. The
+        model would learn to trust its own last output completely --- the same failure
+        as training SC on the true $x_0$.
+  \item \textbf{Independent noise} per step: history is several independent
+        observations of $x_0$. The model learns to treat the carry as fresh evidence;
+        at inference consecutive states are strongly correlated, so it becomes
+        over-confident.
+  \item \textbf{Forward-Markov}, $x^{(i-1)}=x^{(i)}+\text{fresh noise}$: $x_0$ is
+        independent of the past given the present. History carries computation only,
+        which is the regime the fixed-point picture says is the true one. This is the
+        joint law of the exact reverse SDE. For the discrete channels it means nested
+        masks (a site masked at $\sigma_i$ is masked at every noisier level): draw one
+        uniform per site and mask iff $u<r(\sigma)$.
+\end{itemize}
+The current fixed-$x_t$ chain is the $\Delta\sigma=0$ case of this, which is why it is
+leak-free. Forward-Markov neighbours are further apart than consecutive sampler states
+(for a geometric 100-step schedule, about $0.5\sigma$ of fresh noise against about
+$0.1\sigma$ of deterministic motion), so training sees \emph{more} lag than inference:
+conservative in the right direction. \code{\_interpolate\_with\_noise} already moves a
+state to a noisier level; check that its categorical branch re-masks with the
+mask-rate difference.
+
+\subsection{Your concern: per-step losses and the small-model regime}
+
+Today every supervised prediction has 6 or 12 passes behind it; the model is never
+asked to be good with less. A loss on earlier passes would ask exactly that, which is
+your worry, and it is a fair one. The context floor $m_0$ keeps the property: at
+$m_0=n$ no supervised prediction has less context than today's minimum.
+
+$m_0$ is then the dial for your hypothesis. Lowering it ($m_0=3$, then $0$) asks the
+model to be good earlier. If final-state-only supervision is what lets tiny models
+work, validity should fall as $m_0$ falls.
+
+\subsection{Cost and learning rate}\label{sec:cost}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+per optimizer step & current & proposed \\
+\midrule
+forward passes (expected) & 10.5 & 10.5 \\
+tracked passes            & 7 & 7 \\
+supervised predictions    & 1 & 4 \;($m_0{=}6$),\; 5.5 \;($m_0{=}3$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+A step costs the same by construction; it teaches more. Making a step cheaper is a
+separate lever (\S\ref{sec:secondary}, items 1--2).
+
+On the $1/n$ question: Adam divides out the gradient scale, so summing gradients over
+tied passes does not by itself call for a smaller learning rate; the clipping threshold
+is the thing that interacts. The loss above is a mean, so its scale stays put.
+
+Two details. The supervised $\sigma_i$ sit up to $n$ schedule steps below $\sigma_0$
+(about a factor 2 for six steps of a geometric 100-step schedule), so sample $\sigma_0$
+half a walk higher to keep them centred on the training distribution. And the module
+has to build the path itself from $x_0$ and the prior sample, with one uniform per
+site for the masks.
+
+\subsection{Main experiment}
+
+GEOM-Drugs, 2 layers (QM9 validity has no headroom). A $2\times2$:
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+ & loss on last pass only & loss on tracked passes ($m_0{=}6$) \\
+\midrule
+fixed $\sigma$   & A (exists)  & B$'$ \\
+$\sigma$-walk    & B$''$       & \textbf{B} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+B$'$ is a few lines and can run today. All four cost the same per step, so compare at
+equal steps on validity, fc-validity and opt-energy-validity (fixed denominators), then
+molecule stability and opt-rmsd.
+
+\emph{Predictions.} B$'$ $>$ A in speed and stability. B$''$ $>$ A in sample quality
+even where its train loss is no better. B is best, and the two walk arms lose less when
+sampled with 50 or 25 steps. \emph{If instead} B$'$ $<$ A, your hypothesis holds:
+keep the last-pass loss, and the question reduces to B$''$ against A.
+
+% ======================================================================
+\section{The coordinate channel}\label{sec:coords}
+
+\subsection{Why carrying $v$ did nothing}
+
+\begin{enumerate}
+  \item The carry adds computation, not information. So the question is which
+        geometric computation is expensive for two layers and reusable.
+  \item The trunk reads geometry only through invariants: Gram products
+        $\langle x_i,x_j\rangle$ in \code{EdgeMessages}, lengths in \code{LengthsMLP},
+        distances in \code{BondRefine} (output end only). The vector stream itself is
+        only mixed linearly and read by \code{coord\_head}.
+  \item A linear mix of $v_{\text{prev}}$ into the coord sets is therefore visible
+        downstream only through the Gram of the \emph{mixed} sets: current, cross and
+        previous terms tangled in the same 64 channels. The easy useful solution is
+        rank one --- pick out the \code{coord\_head} direction, i.e.\ $\xh$ --- which is
+        just coordinate self-conditioning. Hence \code{v\_lin\_res} $\approx$ SC.
+  \item $\ze$ already \emph{is} the geometry carry. \code{BondRefine} builds it from
+        $\|\xhat{i}-\xhat{j}\|^2$, $\langle\xhat{i},\xhat{j}\rangle$ and the node
+        pairs. The coordinate information crosses the step in the only form the trunk
+        reads.
+  \item What is poorly served is \emph{local distance}. Zero-centred dot products
+        encode a bond length as a small difference of large numbers (worse for big
+        molecules), there is no RBF expansion anywhere, and true distances appear only
+        at the output. In the thesis, RBF distances from the prediction on the edge
+        route were the largest single contributor to self-conditioning.
+\end{enumerate}
+
+\subsection{Proposal: geometry crosses the step as distances}
+
+Carry $\xh$ (it is free: the pass that produced $z$ produced it), and use it twice:
+\begin{align*}
+  \text{equivariant:}\quad & \code{coord\_proj}\big(\,[\,c_{\text{in}}x_t,\ \xh\,]\,\big) && \text{(as SC does today, now refreshed in-chain)}\\
+  \text{invariant:}\quad & e \leftarrow e + W\,\mathrm{RBF}\!\big(\|\xhat{i}-\xhat{j}\|\big) && \text{at \code{e1}, } W \text{ zero-init, } 32{\times}128 \approx 4\text{k params}
+\end{align*}
+$\xh$ is in data units at every $\sigma$, so the RBF grid is fixed (0 to $\sim$10\,\AA).
+Zero at a cold start. Detach $\xh$ first; let gradients through it later.
+
+If you want the full 64-set latent rather than its readout: feed the self-Gram
+$\langle v_{\text{prev},s,i}, v_{\text{prev},s,j}\rangle$ (64 invariants per pair) into
+\code{e1} through a zero-init linear map, 8k parameters. I expect this to be mostly
+redundant with $\ze$; it is the honest test of whether the other 63 directions hold
+anything.
+
+% ======================================================================
+\section{Secondary experiments}\label{sec:secondary}
+
+Separate from the main experiment; ordered by value for cost.
+
+\begin{enumerate}
+  \item \textbf{$K6/n0$ vs $K6/n1$ vs $K6/n6$} on the current scheme. $K6/n0$ is
+        Fixed-Point Forcing, which reports needing no BPTT at all. Tracked passes are
+        the expensive ones (7 of them, every step), so if $n{=}1$ matches $n{=}6$ the
+        method gets much cheaper for free.
+  \item \textbf{Persist and truncate.} Keep the carry alive across optimizer steps on
+        the same batch, backprop through windows of $w$ passes, loss on each: one
+        supervised prediction per forward pass and $w$ graphs in memory instead of 7.
+        This is how TRM and ordinary RNN training amortise the hidden state. Worth
+        doing once the main experiment shows per-pass losses are safe.
+  \item \textbf{Self-sampled discrete reveals} (\S\ref{sec:gap}). Small change on top
+        of the walk; the loss masking already supports it; aimed straight at validity.
+  \item \textbf{$m_0$ sweep} ($3$, $0$) on arm B. The direct test of whether
+        final-state-only supervision is what enables small models.
+  \item \textbf{SC channel ablation} in VEDA-S: coordinates only, discrete only. Tells
+        whether \emph{any} geometric carry matters here, before more is built.
+  \item \textbf{RBF distance injection without LR} (from $\xh$ via SC). Tests point 5 of
+        \S\ref{sec:coords} on its own; could help every few-layer model.
+  \item \textbf{Looped-layer control.} A 3-layer model with the core layer applied $T$
+        times per pass: same parameters as 3 layers, depth per pass $T{+}2$. The natural
+        parameter-matched competitor to cross-step recursion.
+  \item \textbf{Fewer sampling steps.} Sample the main-experiment arms at 100/50/25
+        steps; in the walk arms randomise the stride over $\{1,2,4\}$ schedule points.
+        If LR models degrade more slowly, that is an inference-cost result.
+  \item \textbf{Oracle latent.} At inference, replace the carry with the latent from a
+        pass on the ground-truth molecule. No gain $\Rightarrow$ the mechanism cannot
+        use the channel. Large gain $\Rightarrow$ the model cannot yet produce good
+        latents; spend on training.
+  \item \textbf{Log gates and latent norms} ($\|W\|$ of each transfer; $\|\zs\|,\|\ze\|$
+        per sampling step).
+  \item \textbf{On-policy $x$ with scheduled sampling.} Advance $x$ with the integrator
+        from the model's own prediction instead of the forward-Markov path, with
+        probability $\rho$ ramped during training. Matches inference exactly but
+        regresses towards $x_0$ from states that are no longer its noised versions.
+\end{enumerate}
+
+% ======================================================================
+\section{Literature notes}
+
+From abstracts and secondary summaries; arXiv was not reachable from this session, so
+none of these was read in full. Details marked ``reported'' should be checked.
+
+\begin{itemize}
+  \item \textbf{Flow Reasoning Models} (\href{https://arxiv.org/abs/2606.29150}{2606.29150}).
+        Conventional SC degrades with recurrent depth: exposure bias between one-pass
+        training carries and recursively generated inference states; loss rises with
+        depth as predictions settle at wrong fixed points. \emph{Fixed-Point Forcing}
+        forms the detached carry by repeated application of the denoiser; reported to
+        need no BPTT. This is the present scheme with $K{>}1$, $n{=}0$.
+  \item \textbf{Fixed-point flows} (\href{https://arxiv.org/abs/2607.00714}{2607.00714}).
+        SC in flow language models is a fixed-point iteration on the denoising estimate;
+        under contractivity the fixed point is unique, and replacing the carry by its
+        fixed point leaves an ordinary flow in $x_t$ alone. Supports
+        \S\ref{sec:picture}.
+  \item \textbf{Implicit ML force fields} (\href{https://arxiv.org/abs/2607.29158}{2607.29158});
+        \textbf{DEQuiformer} (\href{https://arxiv.org/abs/2509.08734}{2509.08734}).
+        Equivariant GNNs as fixed-point models; the previous MD step's fixed point
+        warm-starts the next. Reported 2--5$\times$ compute and memory; solver steps
+        from 5--6 to about 3. The same structure as LR at inference, in a
+        supervised setting.
+  \item \textbf{Relay} (\href{https://arxiv.org/abs/2605.22967}{2605.22967}). Learned
+        per-token latent carried across denoising steps of a masked diffusion model;
+        truncated BPTT at horizon 2.
+  \item \textbf{Loopholing}. Deterministic latent pathway across steps, trained
+        SC-style without unrolling.
+  \item \textbf{MetaState} (\href{https://arxiv.org/abs/2603.01331}{2603.01331}).
+        Memory slots carried across denoising steps of a frozen discrete diffusion LM;
+        $K$-step unrolling along a sampled reveal schedule, loss at each step, BPTT;
+        ablations reported to show recurrence and BPTT both matter.
+  \item \textbf{Looped Diffusion Language Models} (\href{https://arxiv.org/abs/2605.26106}{2605.26106}).
+        Looping the early-middle layers of a masked diffusion transformer improves
+        training efficiency and quality. (2606.18022 and 2605.31215 could not be
+        identified by search.)
+  \item \textbf{RIN} (\href{https://arxiv.org/abs/2212.11972}{2212.11972}). Latent
+        self-conditioning: previous-step latents warm-start the current step, trained
+        with stop-gradient at the same $t$, injected through a zero-initialised
+        normalisation.
+  \item \textbf{TRM}. Deep supervision with a detached carry over repeated steps on the
+        same sample; gradient through the last recursion only.
+\end{itemize}
+
+% ======================================================================
+\appendix
+\section{Metric definitions}\label{app:metrics}
+
+\begin{lstlisting}
+# val-validity                 == count(mol is not None) / N
+#   mol_from_atoms(sanitise=True) returns None on failure; mol_is_valid then
+#   re-runs the same idempotent SanitizeMol, so it always passes.
+# val-fc-validity              same, plus len(GetMolFrags(mol)) == 1
+
+# val-opt-energy-validity      denominator = ALL samples
+n_ok = 0
+for mol in all_generated:
+    if mol is None: continue
+    opt = optimise_mol(mol)                 # None only if MMFF raises
+    if opt is None: continue
+    if not isfinite(calc_energy(opt)): continue
+    n_ok += 1
+return n_ok / len(all_generated)
+
+# val-energy                   no optimisation; raw pose; valid mols only
+es = [calc_energy(m) for m in all_generated if m is not None]
+return mean([e for e in es if isfinite(e)])
+
+# val-opt-rmsd                 built AND optimisable mols only
+rmsds = [rmsd(m, optimise_mol(m)) for m in built_and_optimisable]
+return mean(rmsds)                          # centre, Kabsch, sqrt(mean sq dist)
+
+# val-strain(-per-atom)        energy stored in the pose
+diffs = [calc_energy(m) - calc_energy(optimise_mol(m))
+         for m in built_and_optimisable]
+return mean(diffs)
+
+# val-novelty                  valid SMILES only
+return mean([canonical_smiles(m) not in train_smiles for m in valid])
+\end{lstlisting}
+
+\begin{itemize}
+  \item Validity is chemical, not geometric: bonds come from the edge head, valence is
+        checked against the predicted charge, aromatic is a predicted class.
+  \item Only validity, fc-validity and opt-energy-validity have a model-independent
+        denominator. Energy, opt-rmsd and strain average over a subset that grows with
+        model quality.
+  \item Strain is conformational: energy relative to the molecule's own relaxed pose.
+        It is dominated by the worst contact; opt-rmsd averages over atoms.
+  \item \code{optimise\_mol} ignores the convergence flag; \code{AverageStrainEnergy}
+        does not filter \code{inf}/\code{nan}.
+\end{itemize}
+
+\end{document}
