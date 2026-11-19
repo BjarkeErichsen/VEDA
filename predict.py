@@ -64,7 +64,10 @@ def load_model(args, vocab, dm):
         latent_recursion = args.latent_recursion
     else:
         latent_recursion = hparams.get("latent_recursion", False)
-    latrec_transfer = hparams.get("latrec_transfer", "identity")
+    if hasattr(args, "latrec_transfer") and args.latrec_transfer is not None:
+        latrec_transfer = args.latrec_transfer
+    else:
+        latrec_transfer = hparams.get("latrec_transfer", "identity")
 
     dynamics = EquiInvDynamics(
         hparams["d_model"],
@@ -342,6 +345,9 @@ if __name__ == "__main__":
     parser.add_argument("--low_confidence_remask", type=str, default=DEFAULT_LOW_CONFIDENCE_REMASK)
     parser.add_argument("--use_step_size_sampling", action="store_true", default=None, help="Use step size during sampling/inference (default: from checkpoint, or True if not in checkpoint)")
     parser.add_argument("--no_use_step_size_sampling", action="store_false", dest="use_step_size_sampling", help="Disable step size during sampling/inference")
+    parser.add_argument("--latent_recursion", action="store_true", default=None, help="Force enable latent recursion pass-through (default: from checkpoint)")
+    parser.add_argument("--no_latent_recursion", action="store_false", dest="latent_recursion", help="Force disable latent recursion pass-through")
+    parser.add_argument("--latrec_transfer", type=str, default=None, help="Force override latrec_transfer (default: from checkpoint)")
     args = parser.parse_args()
     # Set the default for no_novelty to True
     parser.set_defaults(no_novelty=True)

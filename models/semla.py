@@ -5,6 +5,21 @@ import numpy as np
 import torch
 
 from util import functional as smolF
+from models.lr_mechanisms import (
+    CoordLatentLinResTransfer,
+    CoordLatentSetMixTransfer,
+    CoordNodeLatentNFFTransfer,
+    EdgeLatentBaseTransfer,
+    EdgeLatentGatedTransfer,
+    EdgeLatentLinResTransfer,
+    EdgeLatentTransfer,
+    NFFUpdateTransfer,
+    NodeLatentBaseTransfer,
+    NodeLatentIdentityTransfer,
+    NodeLatentLinResTransfer,
+    VLinResTransfer,
+    VSetMixTransfer,
+)
 
 
 def adj_to_attn_mask(adj_matrix, pos_inf=False):
@@ -25,6 +40,7 @@ def adj_to_attn_mask(adj_matrix, pos_inf=False):
 # *************************************************************************************************
 # *********************************** Helper Classes **********************************************
 # *************************************************************************************************
+
 
 
 class CoordNorm(torch.nn.Module):
@@ -407,8 +423,6 @@ class BondRefine(torch.nn.Module):
 # *************************************************************************************************
 # ********************************** Equivariant Layers *******************************************
 # *************************************************************************************************
-
-
 class EquiMessagePassingLayer(torch.nn.Module):
     def __init__(
         self,
@@ -614,7 +628,21 @@ class EquiInvDynamics(torch.nn.Module):
     def hparams(self):
         return self._hparams
 
-    def forward(self, coords, inv_feats, adj_matrix, atom_mask=None, edge_feats=None, cond_coords=None):
+    def forward(
+        self,
+        coords,
+        inv_feats,
+        adj_matrix,
+        atom_mask=None,
+        edge_feats=None,
+        cond_coords=None,
+        prev_edge_latent=None,
+        latrec_e_readout=None,
+        pair_mask=None,
+        latrec_v=None,
+        prev_coord_latent=None,
+        prev_node_latent=None,
+    ):
         """Generate molecular coordinates and atom features
 
         Args:
@@ -624,13 +652,15 @@ class EquiInvDynamics(torch.nn.Module):
             atom_mask (torch.Tensor, Optional): Mask for fake atoms, shape [batch_size, n_atoms], 1 for real atoms
             edge_feats (torch.Tensor, Optional): In edge features, shape [batch_size, n_nodes, n_nodes, d_edge]
             cond_coords (torch.Tensor, Optional): Conditional coords, shape [batch_size, n_nodes, 3]
+            prev_edge_latent (torch.Tensor, Optional): Carried edge representation from previous step
+            latrec_e_readout (EdgeLatentTransfer, Optional): Readout transfer module before BondRefine (E2)
+            pair_mask (torch.Tensor, Optional): Real atom pair mask, shape [batch_size, n_atoms, n_atoms]
+            latrec_v (CoordLatentTransfer, Optional): Coordinate transfer module before final_ff_block
+            prev_coord_latent (torch.Tensor, Optional): Carried coordinate set representation from previous step
+            prev_node_latent (torch.Tensor, Optional): Carried node scalar representation from previous step
 
         Returns:
-            (coords, atom feats, edge feats)
-            All torch.Tensor, shapes:
-                Coordinates [batch_size, n_atoms, 3],
-                Atom feats [batch_size, n_atoms, d_model]
-                Edge feats [batch_size, n_atoms, n_atoms, d_edge]
+            (coords, atom feats, [edge feats], v_latent)
         """
 
         if edge_feats is not None and self.d_edge is None:
@@ -662,11 +692,27 @@ class EquiInvDynamics(torch.nn.Module):
             elif len(out) == 3:
                 coords, inv_feats, edge_feats = out
 
+        # Coordinate latent recursion: tap coords before final_ff_block (full 64 sets rank)
+        transfer_v = latrec_v or getattr(self, "latrec_v", None)
+        if transfer_v is not None and prev_coord_latent is not None:
+            coords, inv_feats = transfer_v(
+                coords, prev_coord_latent, atom_mask, inv_feats=inv_feats, prev_inv_feats=prev_node_latent
+            )
+        v_latent = coords * atom_mask.unsqueeze(-1)
+
         # Apply a final feedforward block and project coord sets to single coord set
         coords, inv_feats = self.final_ff_block(coords, inv_feats, atom_mask)
         out_coords = self.coord_norm(coords, atom_mask)
         out_coords = self.coord_head(out_coords.transpose(1, -1))
         out_coords = out_coords.transpose(1, -1).squeeze(1)
+
+        # Direct readout injection before BondRefine (E2 variant)
+        transfer_module = latrec_e_readout or getattr(self, "latrec_e_readout", None)
+        if transfer_module is not None and prev_edge_latent is not None:
+            if pair_mask is None:
+                m = atom_mask[:, 0, :] if atom_mask.dim() == 3 else atom_mask
+                pair_mask = (m.unsqueeze(2) * m.unsqueeze(1)).float()
+            edge_feats = transfer_module(edge_feats, prev_edge_latent, pair_mask)
 
         if self.bond_refine:
             atom_mask = atom_mask[:, 0, :]
@@ -675,10 +721,10 @@ class EquiInvDynamics(torch.nn.Module):
         inv_feats = self.feat_norm(inv_feats)
 
         if self.d_edge is None:
-            return out_coords, inv_feats
+            return out_coords, inv_feats, v_latent
 
         edge_feats = self.bond_norm(edge_feats)
-        return out_coords, inv_feats, edge_feats
+        return out_coords, inv_feats, edge_feats, v_latent
 
     def _get_clones(self, module, n):
         return [copy.deepcopy(module) for _ in range(n)]
@@ -749,25 +795,89 @@ class SemlaGenerator(MolecularGenerator):
         self.self_cond = self_cond
         self.latent_recursion = latent_recursion
         self.latrec_transfer = latrec_transfer
+        self.d_edge = d_edge
 
         if self.latent_recursion:
-            if latrec_transfer == "linear":
-                self.latrec_mlp = torch.nn.Sequential(
-                    torch.nn.Linear(2 * d_model, d_model),
-                    torch.nn.SiLU(inplace=False),
-                    torch.nn.Linear(d_model, d_model),
-                )
-                # Initialize output projection to zero for stable initial convergence
-                torch.nn.init.zeros_(self.latrec_mlp[-1].weight)
-                torch.nn.init.zeros_(self.latrec_mlp[-1].bias)
-            elif latrec_transfer == "identity":
+            self.latrec_v = None
+            if latrec_transfer in ["identity", "node_lr_base", "node_lr_identity"]:
+                self.latrec_s = NodeLatentIdentityTransfer()
                 self.latrec_mlp = None
+                self.latrec_e = None
+                self.latrec_e_readout = None
+            elif latrec_transfer in ["node_lr_lin_res"]:
+                self.latrec_s = NodeLatentLinResTransfer(d_model)
+                self.latrec_mlp = None
+                self.latrec_e = None
+                self.latrec_e_readout = None
+            elif any(v in latrec_transfer for v in ["v_setmix", "coord_setmix"]):
+                n_coord_sets = getattr(dynamics, "n_coord_sets", 64)
+                coord_norm = dynamics.hparams.get("coord_norm", "length") if hasattr(dynamics, "hparams") else "length"
+                eps = dynamics.hparams.get("eps", 1e-6) if hasattr(dynamics, "hparams") else 1e-6
+                self.latrec_v = CoordLatentSetMixTransfer(n_coord_sets=n_coord_sets, coord_norm=coord_norm, eps=eps)
+                self.latrec_s = NodeLatentIdentityTransfer() if "+identity" in latrec_transfer else None
+                self.latrec_mlp = None
+                self.latrec_e = None
+                self.latrec_e_readout = None
+            elif any(v in latrec_transfer for v in ["v_lin_res", "coord_lin_res"]):
+                n_coord_sets = getattr(dynamics, "n_coord_sets", 64)
+                self.latrec_v = CoordLatentLinResTransfer(n_coord_sets=n_coord_sets)
+                self.latrec_s = NodeLatentIdentityTransfer() if "+identity" in latrec_transfer else None
+                self.latrec_mlp = None
+                self.latrec_e = None
+                self.latrec_e_readout = None
+            elif any(v in latrec_transfer for v in ["nff_update", "coord_nff"]):
+                n_coord_sets = getattr(dynamics, "n_coord_sets", 64)
+                coord_norm = dynamics.hparams.get("coord_norm", "length") if hasattr(dynamics, "hparams") else "length"
+                self.latrec_v = CoordNodeLatentNFFTransfer(d_model=d_model, n_coord_sets=n_coord_sets, coord_norm=coord_norm)
+                self.latrec_s = NodeLatentIdentityTransfer() if "+identity" in latrec_transfer else None
+                self.latrec_mlp = None
+                self.latrec_e = None
+                self.latrec_e_readout = None
+            elif latrec_transfer in [
+                "node_edge_e1_lin_res",
+                "node_lr_edge_lr_e1_lin_res",
+                "node_lin_res_edge_e1_lin_res",
+                "edge_lr_e1_lin_res+node_lr_lin_res",
+                "node_lr_lin_res+edge_lr_e1_lin_res",
+                "edge_lr_e1_lin_res+node_lin_res",
+            ]:
+                self.latrec_s = NodeLatentLinResTransfer(d_model)
+                self.latrec_mlp = None
+                self.latrec_e = EdgeLatentLinResTransfer(d_edge) if d_edge is not None else None
+                self.latrec_e_readout = None
+            elif "edge_lr" in latrec_transfer or latrec_transfer == "both":
+                self.latrec_s = NodeLatentIdentityTransfer() if (latrec_transfer == "both" or "+identity" in latrec_transfer) else None
+                self.latrec_mlp = None
+                if "lin_res" in latrec_transfer:
+                    transfer_fn = lambda: EdgeLatentLinResTransfer(d_edge) if d_edge is not None else None
+                elif "gated" in latrec_transfer or latrec_transfer in ["edge_lr", "edge_lr_e1", "edge_lr_e2", "both", "edge_lr+identity"]:
+                    transfer_fn = lambda: EdgeLatentGatedTransfer(d_edge) if d_edge is not None else None
+                elif "base" in latrec_transfer:
+                    transfer_fn = lambda: EdgeLatentBaseTransfer() if d_edge is not None else None
+                else:
+                    raise ValueError(
+                        f"Unsupported strategy in latrec_transfer='{latrec_transfer}'. Expected 'base', 'gated', or 'lin_res'."
+                    )
+
+                is_e1e2 = any(loc in latrec_transfer for loc in ["e1e2", "e1_e2", "e1,e2", "e2"]) or latrec_transfer in ["edge_lr", "both", "edge_lr+identity"]
+                self.latrec_e = transfer_fn()
+                self.latrec_e_readout = transfer_fn() if is_e1e2 else None
             else:
                 raise ValueError(
-                    f"Unsupported latrec_transfer='{latrec_transfer}'. Supported choices: ['identity', 'linear']."
+                    f"Unsupported latrec_transfer='{latrec_transfer}'. Supported choices: "
+                    "['identity', 'node_lr_base', 'node_lr_lin_res', "
+                    "'v_setmix', 'v_lin_res', 'nff_update', "
+                    "'node_edge_e1_lin_res', 'edge_lr_e1_lin_res+node_lr_lin_res', "
+                    "'edge_lr_e1_base', 'edge_lr_e1e2_base', "
+                    "'edge_lr_e1_gated', 'edge_lr_e1e2_gated', "
+                    "'edge_lr_e1_lin_res', 'edge_lr_e1e2_lin_res']."
                 )
         else:
+            self.latrec_s = None
             self.latrec_mlp = None
+            self.latrec_e = None
+            self.latrec_e_readout = None
+            self.latrec_v = None
 
         if d_edge is not None or n_edge_types is not None:
             if None in [d_edge, n_edge_types]:
@@ -808,7 +918,10 @@ class SemlaGenerator(MolecularGenerator):
         cond_atomics=None,
         cond_bonds=None,
         atom_mask=None,
+        prev_z=None,
         prev_node_latent=None,
+        prev_edge_latent=None,
+        prev_coord_latent=None,
     ):
         """Predict molecular coordinates and atom types
 
@@ -820,10 +933,13 @@ class SemlaGenerator(MolecularGenerator):
             cond_atomics (torch.Tensor): Conditional atom type logits, shape [batch_size, n_atoms, n_feats]
             cond_bonds (torch.Tensor): Cond bond type logits, shape [batch_size, n_atoms, n_atoms, n_edge_types]
             atom_mask (torch.Tensor): Mask for fake atoms, shape [batch_size, n_atoms], 1 for real atoms
+            prev_z (dict, Optional): State dictionary {"s": node_latent, "e": edge_latent, "v": coord_latent} from previous pass
             prev_node_latent (torch.Tensor, Optional): Carried node scalar state from previous pass, shape [batch_size, n_atoms, d_model]
+            prev_edge_latent (torch.Tensor, Optional): Carried edge state from previous pass, shape [batch_size, n_atoms, n_atoms, d_edge]
+            prev_coord_latent (torch.Tensor, Optional): Carried coord set state from previous pass, shape [batch_size, n_sets, n_atoms, 3]
 
         Returns:
-            (predicted coordinates, atom type logits, bond logits, atom charges, node_latent)
+            (predicted coordinates, atom type logits, bond logits, atom charges, z)
         """
 
         if cond_coords is not None and not self.self_cond:
@@ -835,7 +951,21 @@ class SemlaGenerator(MolecularGenerator):
         if edge_feats is None and cond_bonds is not None:
             raise ValueError("edge_feats must be provided if using bond conditioning.")
 
+        # Unpack carried latent states from prev_z if provided
+        if prev_z is not None:
+            if isinstance(prev_z, dict):
+                if prev_node_latent is None:
+                    prev_node_latent = prev_z.get("s")
+                if prev_edge_latent is None:
+                    prev_edge_latent = prev_z.get("e")
+                if prev_coord_latent is None:
+                    prev_coord_latent = prev_z.get("v")
+            elif isinstance(prev_z, torch.Tensor):
+                if prev_node_latent is None:
+                    prev_node_latent = prev_z
+
         atom_mask = torch.ones_like(coords[..., 0]) if atom_mask is None else atom_mask
+        pair_mask = (atom_mask.unsqueeze(2) * atom_mask.unsqueeze(1)).float()  # [B, N, N]
         adj_matrix = smolF.edges_from_nodes(coords, node_mask=atom_mask)
 
         # Embed the number of atoms in a mol into a small vector and concat this to inv feats for each atom
@@ -848,34 +978,51 @@ class SemlaGenerator(MolecularGenerator):
 
         atom_feats = self.feat_proj(inv_feats)
 
-        # --- latent recursion: identity or linear transfer on node scalar states ---
-        if self.latent_recursion and prev_node_latent is not None:
-            if self.latrec_transfer == "identity":
-                atom_feats = atom_feats + prev_node_latent
-            elif self.latrec_transfer == "linear" and self.latrec_mlp is not None:
-                concat_feats = torch.cat((atom_feats, prev_node_latent), dim=-1)
-                atom_feats = atom_feats + self.latrec_mlp(concat_feats)
+        # --- latent recursion: node scalar states transfer ---
+        if self.latent_recursion and prev_node_latent is not None and self.latrec_s is not None:
+            atom_feats = self.latrec_s(atom_feats, prev_node_latent, atom_mask)
         atom_feats = atom_feats * atom_mask.unsqueeze(-1)
-        # ---------------------------------------------------------------------------
+        # -----------------------------------------------------
 
         if edge_feats is not None:
             edge_feats = edge_feats.float()
             edge_feats = torch.cat((edge_feats, cond_bonds), dim=-1) if cond_bonds is not None else edge_feats
             edge_feats = self.edge_in_proj(edge_feats)
+            # Injection Point 1 (E1/E2): inject after edge_in_proj
+            if self.latrec_e is not None and prev_edge_latent is not None:
+                edge_feats = self.latrec_e(edge_feats, prev_edge_latent, pair_mask)
 
         out = self.dynamics(
-            coords, atom_feats, adj_matrix, atom_mask=atom_mask, edge_feats=edge_feats, cond_coords=cond_coords
+            coords,
+            atom_feats,
+            adj_matrix,
+            atom_mask=atom_mask,
+            edge_feats=edge_feats,
+            cond_coords=cond_coords,
+            prev_edge_latent=prev_edge_latent,
+            latrec_e_readout=self.latrec_e_readout,
+            pair_mask=pair_mask,
+            latrec_v=self.latrec_v,
+            prev_coord_latent=prev_coord_latent,
+            prev_node_latent=prev_node_latent,
         )
 
         pred_edges = None
+        v_latent = None
         if len(out) == 2:
             pred_coords, pred_feats = out
         elif len(out) == 3:
-            pred_coords, pred_feats, pred_edges = out
+            if self.d_edge is None:
+                pred_coords, pred_feats, v_latent = out
+            else:
+                pred_coords, pred_feats, pred_edges = out
+        elif len(out) == 4:
+            pred_coords, pred_feats, pred_edges, v_latent = out
 
         pred_coords = smolF.zero_com(pred_coords, node_mask=atom_mask)
         pred_coords = pred_coords * atom_mask.unsqueeze(-1)
 
+        v_carried = v_latent if self.latent_recursion else None
         node_latent = pred_feats * atom_mask.unsqueeze(-1) if self.latent_recursion else None
 
         type_logits = self.atom_classifier_head(pred_feats)
@@ -885,6 +1032,9 @@ class SemlaGenerator(MolecularGenerator):
         if pred_edges is not None:
             pred_edges = pred_edges + pred_edges.transpose(1, 2)
             edge_logits = self.edge_out_proj(pred_edges)
-            return pred_coords, type_logits, edge_logits, charge_logits, node_latent
+            e_latent = pred_edges * pair_mask.unsqueeze(-1) if self.latent_recursion else None
+            z = {"s": node_latent, "e": e_latent, "v": v_carried} if self.latent_recursion else None
+            return pred_coords, type_logits, edge_logits, charge_logits, z
 
-        return pred_coords, type_logits, charge_logits, node_latent
+        z = {"s": node_latent, "e": None, "v": v_carried} if self.latent_recursion else None
+        return pred_coords, type_logits, charge_logits, z

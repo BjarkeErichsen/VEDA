@@ -709,7 +709,7 @@ class MolecularCFM(L.LightningModule):
 
         self._init_params()
 
-    def forward(self, batch, t, training=False, cond_batch=None, prev_node_latent=None):
+    def forward(self, batch, t, training=False, cond_batch=None, prev_z=None, prev_node_latent=None):
         """Predict molecular coordinates and atom types
 
         Args:
@@ -717,11 +717,15 @@ class MolecularCFM(L.LightningModule):
             t (torch.Tensor): Interpolation times between 0 and 1, shape [batch_size]
             training (bool): Whether to run forward in training mode
             cond_batch (dict[str, Tensor]): Predictions from previous step, if we are using self conditioning
-            prev_node_latent (torch.Tensor, Optional): Carried node scalar state from previous pass
+            prev_z (dict, Optional): State dictionary {"s": node_latent, "e": edge_latent} from previous pass
+            prev_node_latent (torch.Tensor, Optional): Backward-compatible carried node scalar state
 
         Returns:
-            (predicted coordinates, atom type logits, bond logits, charge logits, node_latent)
+            (predicted coordinates, atom type logits, bond logits, charge logits, z)
         """
+        if prev_z is None and prev_node_latent is not None:
+            prev_z = {"s": prev_node_latent, "e": None}
+
         coords = batch["coords"]
         atom_types = batch["atomics"]
         bonds = batch["bonds"]
@@ -747,14 +751,14 @@ class MolecularCFM(L.LightningModule):
                 cond_atomics=cond_batch["atomics"],
                 cond_bonds=cond_batch["bonds"],
                 atom_mask=mask,
-                prev_node_latent=prev_node_latent,
+                prev_z=prev_z,
             )
 
         else:
             net_out = model(
-                input_coords, features, edge_feats=bonds, atom_mask=mask, prev_node_latent=prev_node_latent
+                input_coords, features, edge_feats=bonds, atom_mask=mask, prev_z=prev_z
             )
-        output_coords, output_types, output_bonds, output_charges, node_latent = net_out
+        output_coords, output_types, output_bonds, output_charges, z = net_out
         
         # Apply x-prediction mode if enabled
         if self.x_pred_mode == 'constant':
@@ -767,7 +771,7 @@ class MolecularCFM(L.LightningModule):
         
         coords = output_coords*coef["c_out"].view(-1, 1, 1) + coords*coef["c_skip"].view(-1, 1, 1)
 
-        return coords, output_types, output_bonds, output_charges, node_latent
+        return coords, output_types, output_bonds, output_charges, z
 
     def training_step(self, batch, b_idx):
         return self._training_step(batch, b_idx)
@@ -778,6 +782,21 @@ class MolecularCFM(L.LightningModule):
             "coords": torch.zeros_like(interpolated["coords"]),
             "atomics": torch.zeros_like(interpolated["atomics"]),
             "bonds": torch.zeros_like(interpolated["bonds"])
+        }
+
+    def _get_initial_edge_latent(self, interpolated):
+        """Initialize cold-start edge latent with zeros so latrec_e always runs static graph"""
+        b, n, _, _ = interpolated["bonds"].shape
+        d_edge = getattr(self.gen, "d_edge", None) or getattr(self, "d_edge", 128)
+        return torch.zeros(b, n, n, d_edge, device=interpolated["bonds"].device, dtype=interpolated["bonds"].dtype)
+
+    def _get_initial_z(self, interpolated):
+        """Initialize carried latent dictionary z = {"s": ..., "e": ..., "v": ...}"""
+        is_edge_mode = "edge" in self.latrec_transfer or self.latrec_transfer == "both"
+        return {
+            "s": None,
+            "e": self._get_initial_edge_latent(interpolated) if is_edge_mode else None,
+            "v": None,
         }
 
     def _generate_self_condition(self, interpolated, times, cond_batch):
@@ -804,22 +823,22 @@ class MolecularCFM(L.LightningModule):
             cond_batch = self._generate_self_condition(interpolated, times, cond_batch)
 
         # --- latent recursion chain ---
-        node_latent = None
-        if self.latent_recursion and torch.rand(1).item() < self.latrec_p:
-            if self.latrec_k > 0:
+        z = self._get_initial_z(interpolated) if self.latent_recursion else None
+        if self.latent_recursion:
+            if self.latrec_k > 0 and torch.rand(1).item() < self.latrec_p:
                 with torch.no_grad():
                     for _ in range(self.latrec_k):
-                        *_, node_latent = self(
+                        *_, z = self(
                             interpolated, times, training=True,
-                            cond_batch=cond_batch, prev_node_latent=node_latent,
+                            cond_batch=cond_batch, prev_z=z,
                         )
-                if node_latent is not None:
-                    node_latent = node_latent.detach()
+                if z is not None and isinstance(z, dict):
+                    z = {k: (v.detach() if v is not None else None) for k, v in z.items()}
 
             for _ in range(self.latrec_n):
-                *_, node_latent = self(
+                *_, z = self(
                     interpolated, times, training=True,
-                    cond_batch=cond_batch, prev_node_latent=node_latent,
+                    cond_batch=cond_batch, prev_z=z,
                 )
 
         # --- final tracked pass producing the loss ---
@@ -828,7 +847,7 @@ class MolecularCFM(L.LightningModule):
             times,
             training=True,
             cond_batch=cond_batch,
-            prev_node_latent=node_latent,
+            prev_z=z,
         )
         predicted = {
             "coords": coords,
@@ -1126,7 +1145,7 @@ class MolecularCFM(L.LightningModule):
         print(f"Time taken for time schedule: {time_end - time_start} seconds")
         time_start = time.time()
         cond_batch = self._get_initial_cond_batch(prior) if self.self_condition else None
-        node_latent = None
+        z = self._get_initial_z(prior) if self.latent_recursion else None
         with torch.no_grad():
             
             for t_idx, step_size in enumerate(step_sizes):
@@ -1140,8 +1159,8 @@ class MolecularCFM(L.LightningModule):
                     step_size += (times_hat[0].item() - times[0].item())
                     curr = self._interpolate_with_noise(curr, times, times_hat)
 
-                coords, type_logits, bond_logits, charge_logits, node_latent = self(
-                    curr, times_hat, training=False, cond_batch=cond, prev_node_latent=node_latent
+                coords, type_logits, bond_logits, charge_logits, z = self(
+                    curr, times_hat, training=False, cond_batch=cond, prev_z=z
                 )
                 times = times_hat - step_size
                 times = torch.clamp(times, min=1e-6)
@@ -1362,8 +1381,46 @@ class MolecularCFM(L.LightningModule):
 
     def _init_params(self):
         for p in self.parameters():
+            if getattr(p, "_no_reinit", False):
+                continue
             if p.dim() > 1:
                 torch.nn.init.xavier_uniform_(p)
+        # Ensure any latrec zero-inits are strictly preserved
+        if hasattr(self.gen, "latrec_s") and self.gen.latrec_s is not None:
+            if hasattr(self.gen.latrec_s, "gate"):
+                torch.nn.init.zeros_(self.gen.latrec_s.gate)
+            elif hasattr(self.gen.latrec_s, "linear"):
+                torch.nn.init.zeros_(self.gen.latrec_s.linear.weight)
+                torch.nn.init.zeros_(self.gen.latrec_s.linear.bias)
+            elif hasattr(self.gen.latrec_s, "mlp"):
+                torch.nn.init.zeros_(self.gen.latrec_s.mlp[-1].weight)
+                torch.nn.init.zeros_(self.gen.latrec_s.mlp[-1].bias)
+        if hasattr(self.gen, "latrec_mlp") and self.gen.latrec_mlp is not None:
+            torch.nn.init.zeros_(self.gen.latrec_mlp[-1].weight)
+            torch.nn.init.zeros_(self.gen.latrec_mlp[-1].bias)
+        if hasattr(self.gen, "latrec_e") and self.gen.latrec_e is not None:
+            if hasattr(self.gen.latrec_e, "gate"):
+                torch.nn.init.zeros_(self.gen.latrec_e.gate)
+            elif hasattr(self.gen.latrec_e, "linear"):
+                torch.nn.init.zeros_(self.gen.latrec_e.linear.weight)
+                torch.nn.init.zeros_(self.gen.latrec_e.linear.bias)
+        if hasattr(self.gen, "latrec_e_readout") and self.gen.latrec_e_readout is not None:
+            if hasattr(self.gen.latrec_e_readout, "gate"):
+                torch.nn.init.zeros_(self.gen.latrec_e_readout.gate)
+            elif hasattr(self.gen.latrec_e_readout, "linear"):
+                torch.nn.init.zeros_(self.gen.latrec_e_readout.linear.weight)
+                torch.nn.init.zeros_(self.gen.latrec_e_readout.linear.bias)
+        if hasattr(self.gen, "latrec_v") and self.gen.latrec_v is not None:
+            if hasattr(self.gen.latrec_v, "gate"):
+                torch.nn.init.zeros_(self.gen.latrec_v.gate)
+            if hasattr(self.gen.latrec_v, "gate_v"):
+                torch.nn.init.zeros_(self.gen.latrec_v.gate_v)
+            if hasattr(self.gen.latrec_v, "gate_s"):
+                torch.nn.init.zeros_(self.gen.latrec_v.gate_s)
+            if hasattr(self.gen.latrec_v, "linear"):
+                torch.nn.init.zeros_(self.gen.latrec_v.linear.weight)
+                if getattr(self.gen.latrec_v.linear, "bias", None) is not None:
+                    torch.nn.init.zeros_(self.gen.latrec_v.linear.bias)
     def _interpolate_mol(self, from_mols: dict, to_mols: dict, delta_t: float, delta_mask_rate: float, curr_probs = None) -> dict:
         """Interpolates mols which have already been sampled according to OT map, if required"""
         #to_mols is the sample, from_mol is the noise

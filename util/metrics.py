@@ -389,6 +389,9 @@ class FCD_Score(GenerativeMetric):
         futures = [executor.submit(smolRD.smiles_from_mol, mol, canonical=True) for mol in existing_mols]
         smiles = [future.result() for future in futures]
         smiles = [smi for smi in smiles if smi is not None]
+        # Fall back to CPU if CUDA is requested but unavailable
+        if str(device).startswith("cuda") and not torch.cuda.is_available():
+            device = "cpu"
         # Initialize FCD calculator
         self.fcd = FCD(device=device, n_jobs=n_jobs)
         # Precompute the reference distributions

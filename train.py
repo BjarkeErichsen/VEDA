@@ -476,7 +476,7 @@ if __name__ == "__main__":
     parser.add_argument("--latrec_n", type=int, default=DEFAULT_LATREC_N, help="Number of tracked BPTT passes (default: 0)")
     parser.add_argument("--latrec_k", type=int, default=DEFAULT_LATREC_K, help="Number of untracked warm-up passes (default: 1)")
     parser.add_argument("--latrec_p", type=float, default=DEFAULT_LATREC_P, help="Chain execution probability (default: 0.5)")
-    parser.add_argument("--latrec_transfer", type=str, default=DEFAULT_LATREC_TRANSFER, help="Transfer operator (default: identity)")
+    parser.add_argument("--latrec_transfer", type=str, default=DEFAULT_LATREC_TRANSFER, help="Transfer operator (identity, linear, edge_lr; default: identity)")
 
     parser.set_defaults(
         trial_run=False,
