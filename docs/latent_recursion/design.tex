@@ -37,6 +37,7 @@
 \newcommand{\xh}{\hat{x}_0}
 \newcommand{\xhat}[1]{\hat{x}_{0,#1}}
 \newcommand{\sg}{\mathrm{sg}}
+\usepackage[htt]{hyphenat}
 \newcommand{\code}[1]{\texttt{#1}}
 
 \title{Latent Recursion in VEDA-S\\\large Design document v5: results, design space, and a proposed training method}
@@ -71,12 +72,25 @@ Both are tapped before their readout heads. Injected after \code{feat\_proj} and
 \[
   h \leftarrow h + W\,[\,h \,\|\, h - h_{\text{prev}}\,], \qquad W \text{ zero-initialised (with bias).}
 \]
-Added parameters: $768{\times}384 + 256{\times}128 \approx 0.33$M (a core layer is
-roughly 1.8M).
+Implemented in \code{models/lr\_mechanisms.py} as
+\code{NodeLatentLinResTransfer} and \code{EdgeLatentLinResTransfer}.
+Added parameters:
+$(768{\times}384+384) + (256{\times}128+128) = 328{,}192$, which is exactly the measured
+delta in \S\ref{sec:results}. A core layer is roughly 1.8\,M.
 
-\paragraph{Training.} Algorithm~\ref{alg:current}, as run for the experiments below
-(the copy of \code{fm.py} on the remote still has the older version, where $p$ gated
-the whole chain). $p$ switches only the untracked warm-up; the $n$ tracked passes
+\paragraph{Code state (\code{main} at \code{8230654}).} The plumbing proposed in
+earlier revisions has landed: the carry is a dict $z=\{\code{s},\code{e},\code{v}\}$
+threaded through \code{MolecularCFM.forward} and \code{SemlaGenerator.forward};
+\code{\_init\_params} now skips parameters flagged \code{\_no\_reinit} and re-zeroes the
+transfer weights explicitly, so the zero-initialisations survive; the transfers live in
+their own module; and all three coordinate mechanisms of
+\S\ref{sec:coords} are implemented (\code{v\_setmix}, \code{v\_lin\_res},
+\code{nff\_update}). One consequence to keep in mind: \code{EquiInvDynamics.forward} now
+always materialises \code{v\_latent} $[B,64,N,3]$ and returns it, including when latent
+recursion is off, where it is discarded.
+
+\paragraph{Training.} Algorithm~\ref{alg:current}. $p$ switches only the untracked
+warm-up (\code{if self.latrec\_k > 0 and torch.rand(1).item() < self.latrec\_p}); the $n$ tracked passes
 always run. All passes see the same $(x_t,\sigma)$; one loss, on the last pass; the SC
 batch $c$ is computed once by a latent-free pass and held fixed for the whole chain.
 
@@ -518,7 +532,49 @@ keep the last-pass loss, and the question reduces to B$''$ against A.
         route were the largest single contributor to self-conditioning.
 \end{enumerate}
 
-\subsection{Proposal: geometry crosses the step as distances}
+\subsection{The implemented injection site is at the wrong end}\label{sec:vsite}
+
+Points 1--5 were written before the coordinate mechanisms were implemented. They now
+are, and the implementation has a property that is a simpler explanation than any of
+them. In \code{EquiInvDynamics.forward}:
+
+\begin{lstlisting}
+for layer in self.layers:          # the whole 12-layer trunk
+    ...
+# Coordinate latent recursion: tap coords before final_ff_block
+if transfer_v is not None and prev_coord_latent is not None:
+    coords, inv_feats = transfer_v(coords, prev_coord_latent, ...)
+v_latent = coords * atom_mask.unsqueeze(-1)
+
+coords, inv_feats = self.final_ff_block(coords, inv_feats, atom_mask)
+out_coords = self.coord_head(self.coord_norm(coords, atom_mask)...)
+\end{lstlisting}
+
+The \emph{tap} is right: before \code{final\_ff\_block}, so the carried state is the
+full-rank 64-set geometry and not the rank-one output of \code{EquivariantMLP}. But the
+\emph{injection} is at the same point, after the trunk. Everything downstream of it is
+\code{final\_ff\_block} (one \code{NodeFeedForward}, purely intra-atom) and
+\code{coord\_head} (bias-free $64\to1$).
+
+\textbf{So the carried coordinates never pass through message passing.} No atom can see
+a neighbour's carried geometry. The most the mechanism can do is apply a per-atom linear
+shift to the output --- which is coordinate self-conditioning with extra channels, and
+which is what \code{v\_lin\_res} $\approx$ SC measured. The same holds for
+\code{nff\_update}'s $\Delta s$: it is added to \code{inv\_feats} after the trunk, so it
+reaches only \code{final\_ff\_block}, \code{feat\_norm} and the heads.
+
+The fix is to move the injection to just after \code{coord\_proj} and the mask expand,
+keeping the tap where it is, so the carried geometry enters before layer 0 and is seen by
+all 12 layers --- the same convention as $\zs$ at \code{feat\_proj} and $\ze$ at
+\code{edge\_in\_proj}. That makes the coordinate channel's null result a real test rather
+than a test of a disconnected path. It is a few lines and should precede
+\S\ref{sec:vdist}.
+
+One thing to watch once it is connected: \code{v\_latent} is tapped \emph{after} the
+injection, so $v_t = v_t + W(\cdot,v_{t-1})$ is a direct linear recurrence across
+sampling steps. Over 100 steps that can grow. Log $\|v_{\text{latent}}\|$ per step.
+
+\subsection{Proposal: geometry crosses the step as distances}\label{sec:vdist}
 
 Carry $\xh$ (it is free: the pass that produced $z$ produced it), and use it twice:
 \begin{align*}
@@ -540,6 +596,9 @@ anything.
 Separate from the main experiment; ordered by value for cost.
 
 \begin{enumerate}
+  \item \textbf{Move the coordinate injection to initialisation} (\S\ref{sec:vsite}) and
+        re-run \code{v\_setmix} and \code{v\_lin\_res}. A few lines, and until it is done
+        the coordinate channel has not really been tested.
   \item \textbf{$K6/n0$ vs $K6/n1$ vs $K6/n6$} on the current scheme. $K6/n0$ is
         Fixed-Point Forcing, which reports needing no BPTT at all. Tracked passes are
         the expensive ones (7 of them, every step), so if $n{=}1$ matches $n{=}6$ the
